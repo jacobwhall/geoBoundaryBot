@@ -1,0 +1,44 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cgaz-operator
+  namespace: geoboundaries
+  labels:
+    app: cgaz-builder
+spec:
+  securityContext:
+    runAsUser: 71032
+    runAsGroup: 9915
+  containers:
+    - name: cgaz-builder
+      image: ghcr.io/wmgeolab/gb-base:latest
+      imagePullPolicy: Always
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          echo "Starting CGAZ builder...";
+          cd /sciclone/geograd/geoBoundaries/geoBoundaryBot/geoBoundaryBuilder/modules/;
+          python3 cgaz_builder.py -v;
+          echo "CGAZ build completed.";
+      resources:
+        requests:
+          memory: "512Gi"
+          cpu: "16"
+        limits:
+          memory: "512Gi"
+          cpu: "32"
+      volumeMounts:
+        - name: nfs-mount
+          mountPath: /sciclone/geograd/geoBoundaries
+        - name: home-mount
+          mountPath: /home
+  restartPolicy: OnFailure
+  volumes:
+    - name: nfs-mount
+      nfs:
+        server: 128.239.59.144 
+        path: /sciclone/geograd/geoBoundaries
+    - name: home-mount
+      nfs:
+        server: 128.239.56.166
+        path: /sciclone/home/
