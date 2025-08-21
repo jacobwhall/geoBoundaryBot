@@ -49,13 +49,12 @@ RUN curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /
 # Upgrade pip and install Python dependencies in a single layer
 RUN pip install --upgrade pip && \
     pip install \
-    numpy<2.0.0 \
+    "numpy<2.0.0" \
     geopandas==0.13.2 \
     fiona==1.9.5 \
     shapely \
     rasterio \
     pyproj \
-    mlflow==2.18.0 \
     kubernetes==31.0.0 \
     jsonschema==4.19.0 \
     zipfile36==0.1.3 \
