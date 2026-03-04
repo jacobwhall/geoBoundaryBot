@@ -13,13 +13,13 @@ os.makedirs(log_dir, exist_ok=True)
 log_file = os.path.join(log_dir, "git_operator.log")
 
 # Configure logging
-handler = TimedRotatingFileHandler(log_file, when='midnight', interval=1)
+handler = TimedRotatingFileHandler(log_file, when="midnight", interval=1)
 handler.suffix = "%Y-%m-%d.log"
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S %Z',
-    handlers=[handler]
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S %Z",
+    handlers=[handler],
 )
 
 # Constants
@@ -36,6 +36,7 @@ DB_USER = "geoboundaries"
 DB_PASSWORD = ""  # Trust-based auth, no password
 DB_PORT = 5432
 
+
 def connect_to_db():
     """Establishes a connection to the PostGIS database with retry mechanism."""
     max_retries = 5
@@ -44,24 +45,25 @@ def connect_to_db():
     for attempt in range(max_retries):
         try:
             conn = psycopg2.connect(
-                dbname=DB_NAME,
-                user=DB_USER,
-                password="",
-                host=DB_SERVICE,
-                port=DB_PORT
+                dbname=DB_NAME, user=DB_USER, password="", host=DB_SERVICE, port=DB_PORT
             )
             logging.info("Database connection established.")
             return conn
         except Exception as e:
             if attempt < max_retries - 1:
                 # Calculate exponential backoff delay
-                delay = base_delay * (2 ** attempt)
-                logging.warning(f"Database connection attempt {attempt + 1} failed: {e}. "
-                                f"Retrying in {delay} seconds...")
+                delay = base_delay * (2**attempt)
+                logging.warning(
+                    f"Database connection attempt {attempt + 1} failed: {e}. "
+                    f"Retrying in {delay} seconds..."
+                )
                 time.sleep(delay)
             else:
-                logging.error(f"Database connection failed after {max_retries} attempts: {e}")
+                logging.error(
+                    f"Database connection failed after {max_retries} attempts: {e}"
+                )
                 raise
+
 
 def log_subprocess_output(cmd, result, log_success=True, log_error=True):
     """
@@ -83,18 +85,22 @@ def log_subprocess_output(cmd, result, log_success=True, log_error=True):
     # Log stderr only if it contains a real error
     if result.stderr:
         # Filter out known non-error messages
-        filtered_stderr = "\n".join([
-            line for line in result.stderr.strip().split("\n")
-            if line and
-            not line.startswith(" = [up to date]") and
-            "Already up to date" not in line
-        ])
+        filtered_stderr = "\n".join(
+            [
+                line
+                for line in result.stderr.strip().split("\n")
+                if line
+                and not line.startswith(" = [up to date]")
+                and "Already up to date" not in line
+            ]
+        )
 
         # Log stderr only if there's a real error message after filtering
         if filtered_stderr and (result.returncode != 0 or log_error):
             logging.error("Command STDERR:\n" + filtered_stderr)
 
     return result.returncode == 0
+
 
 def git_pull():
     """Executes git pull and updates database status with detailed logging."""
@@ -120,18 +126,24 @@ def git_pull():
         logging.info(f"SSH directory created/verified at: {SSH_DIR}")
 
         # Add GitHub to known hosts
-        subprocess.run(["ssh-keyscan", "-H", "github.com"], stdout=open(KNOWN_HOSTS, "a"), check=True)
+        subprocess.run(
+            ["ssh-keyscan", "-H", "github.com"],
+            stdout=open(KNOWN_HOSTS, "a"),
+            check=True,
+        )
         os.chmod(KNOWN_HOSTS, 0o600)
         logging.info(f"Known hosts updated at: {KNOWN_HOSTS}")
 
         # Prepare git environment
         git_env = {
             "HOME": HOME_DIR,
-            "GIT_SSH_COMMAND": f"ssh -i {SSH_KEY} -o UserKnownHostsFile={KNOWN_HOSTS}"
+            "GIT_SSH_COMMAND": f"ssh -i {SSH_KEY} -o UserKnownHostsFile={KNOWN_HOSTS}",
         }
 
         # Git config
-        config_cmd = f"git -C {GIT_REPO_DIR} config --global --add safe.directory {GIT_REPO_DIR}"
+        config_cmd = (
+            f"git -C {GIT_REPO_DIR} config --global --add safe.directory {GIT_REPO_DIR}"
+        )
         config_result = subprocess.run(
             config_cmd,
             shell=True,
@@ -172,7 +184,9 @@ def git_pull():
         if lfs_result.returncode != 0:
             # Check if the error is specifically about pointer files
             if "file that should have been a pointer" in lfs_result.stderr:
-                logging.warning("LFS pointer file issue detected. Logging error but continuing sync.")
+                logging.warning(
+                    "LFS pointer file issue detected. Logging error but continuing sync."
+                )
                 logging.warning(f"LFS fetch stderr: {lfs_result.stderr}")
             else:
                 logging.error(f"LFS fetch failed: {lfs_result.stderr}")
@@ -180,7 +194,11 @@ def git_pull():
                 overall_success = False
 
         # Determine overall status
-        status_message = "Successful git pull and LFS sync" if overall_success else "Partial or complete git sync failure"
+        status_message = (
+            "Successful git pull and LFS sync"
+            if overall_success
+            else "Partial or complete git sync failure"
+        )
 
         # Calculate and log total runtime
         end_time = datetime.now()
@@ -209,10 +227,13 @@ def git_pull():
                     SET "TIME" = %s, "STATUS" = %s
                     WHERE "STATUS_TYPE" = 'GIT_PULL'
                     """
-                    cur.execute(update_query, (datetime.now(), f"Git sync failed: {str(e)}"))
+                    cur.execute(
+                        update_query, (datetime.now(), f"Git sync failed: {str(e)}")
+                    )
                     conn.commit()
         except Exception as db_error:
             logging.error(f"Could not log error to database: {db_error}")
+
 
 def check_git_pull_status():
     """Check if git pull is needed based on conditions:
@@ -227,18 +248,20 @@ def check_git_pull_status():
         with connect_to_db() as conn:
             with conn.cursor() as cur:
                 # Check for ready tasks
-                cur.execute('SELECT COUNT(*) FROM tasks WHERE status = \'ready\'')
+                cur.execute("SELECT COUNT(*) FROM tasks WHERE status = 'ready'")
                 ready_count = cur.fetchone()[0]
                 if ready_count > 0:
                     logging.info(f"Found {ready_count} ready tasks. Skipping git pull.")
                     # Get last successful pull time for status message
-                    cur.execute('SELECT "TIME" FROM status WHERE "STATUS_TYPE" = \'GIT_PULL\'')
+                    cur.execute(
+                        'SELECT "TIME" FROM status WHERE "STATUS_TYPE" = \'GIT_PULL\''
+                    )
                     last_pull = cur.fetchone()
-                    last_pull_time = last_pull[0] if last_pull else 'Never'
+                    last_pull_time = last_pull[0] if last_pull else "Never"
                     status_msg = f"Git pull skipped due to ongoing tasks; last successful pull was {last_pull_time}"
                     cur.execute(
                         'UPDATE status SET "TIME" = %s, "STATUS" = %s WHERE "STATUS_TYPE" = \'GIT_PULL\'',
-                        (datetime.now(), status_msg)
+                        (datetime.now(), status_msg),
                     )
                     conn.commit()
                     return False
@@ -253,21 +276,27 @@ def check_git_pull_status():
                 if last_task_time:
                     time_since_last_task = datetime.now() - last_task_time
                     if time_since_last_task < timedelta(hours=3):
-                        logging.info(f"Only {time_since_last_task} since last task completion. Skipping git pull.")
+                        logging.info(
+                            f"Only {time_since_last_task} since last task completion. Skipping git pull."
+                        )
                         # Get last successful pull time for status message
-                        cur.execute('SELECT "TIME" FROM status WHERE "STATUS_TYPE" = \'GIT_PULL\'')
+                        cur.execute(
+                            'SELECT "TIME" FROM status WHERE "STATUS_TYPE" = \'GIT_PULL\''
+                        )
                         last_pull = cur.fetchone()
-                        last_pull_time = last_pull[0] if last_pull else 'Never'
+                        last_pull_time = last_pull[0] if last_pull else "Never"
                         status_msg = f"Git pull skipped due to recent task activity; last successful pull was {last_pull_time}"
                         cur.execute(
                             'UPDATE status SET "TIME" = %s, "STATUS" = %s WHERE "STATUS_TYPE" = \'GIT_PULL\'',
-                            (datetime.now(), status_msg)
+                            (datetime.now(), status_msg),
                         )
                         conn.commit()
                         return False
 
                 # Check time since last git pull
-                cur.execute('SELECT "TIME" FROM status WHERE "STATUS_TYPE" = \'GIT_PULL\'')
+                cur.execute(
+                    'SELECT "TIME" FROM status WHERE "STATUS_TYPE" = \'GIT_PULL\''
+                )
                 result = cur.fetchone()
 
                 if result is None:
@@ -279,21 +308,26 @@ def check_git_pull_status():
                 time_since_last_pull = datetime.now() - last_pull_time
 
                 if time_since_last_pull >= timedelta(hours=12):
-                    logging.info(f"Last git pull was {time_since_last_pull} ago. Running git pull.")
+                    logging.info(
+                        f"Last git pull was {time_since_last_pull} ago. Running git pull."
+                    )
                     git_pull()
                     return True
                 else:
-                    logging.info(f"Last git pull was {time_since_last_pull} ago. No action needed.")
+                    logging.info(
+                        f"Last git pull was {time_since_last_pull} ago. No action needed."
+                    )
                     status_msg = f"Git pull skipped (too soon); last successful pull was {last_pull_time}"
                     cur.execute(
                         'UPDATE status SET "TIME" = %s, "STATUS" = %s WHERE "STATUS_TYPE" = \'GIT_PULL\'',
-                        (datetime.now(), status_msg)
+                        (datetime.now(), status_msg),
                     )
                     conn.commit()
                     return False
     except Exception as e:
         logging.error(f"Error checking git pull status: {e}")
         return False
+
 
 if __name__ == "__main__":
     logging.info("Script started.")
@@ -307,7 +341,9 @@ if __name__ == "__main__":
         try:
             with connect_to_db() as conn:
                 with conn.cursor() as cur:
-                    cur.execute('SELECT "TIME" FROM status WHERE "STATUS_TYPE" = \'GIT_PULL\'')
+                    cur.execute(
+                        'SELECT "TIME" FROM status WHERE "STATUS_TYPE" = \'GIT_PULL\''
+                    )
                     result = cur.fetchone()
                     if result:
                         last_pull_time = result[0]

@@ -14,21 +14,23 @@ log_file = os.path.join(log_dir, "worker_operator.log")
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
         logging.FileHandler(log_file),
-        logging.StreamHandler()  # Also log to console
-    ]
+        logging.StreamHandler(),  # Also log to console
+    ],
 )
 
 # Rotate log files daily
 file_handler = TimedRotatingFileHandler(
     log_file,
-    when='midnight',
+    when="midnight",
     interval=1,
-    backupCount=3  # Keep logs for 30 days
+    backupCount=3,  # Keep logs for 30 days
 )
-file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+file_handler.setFormatter(
+    logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+)
 logging.getLogger().addHandler(file_handler)
 
 # Database Configuration
@@ -47,6 +49,7 @@ MAX_FAILED_PODS = 3  # Maximum failed pods before stopping task controller
 # Counter for failed pods
 failed_pod_count = 0
 
+
 # Load Kubernetes Configuration
 def load_kubernetes_config():
     try:
@@ -60,11 +63,16 @@ def load_kubernetes_config():
         logging.error(f"Error loading Kubernetes configuration: {e}")
         raise
 
+
 # Connect to the database
 def connect_to_db():
     try:
         conn = psycopg2.connect(
-            dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD, host=DB_SERVICE, port=DB_PORT
+            dbname=DB_NAME,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            host=DB_SERVICE,
+            port=DB_PORT,
         )
         logging.debug("Database connection established successfully.")
         return conn
@@ -72,39 +80,55 @@ def connect_to_db():
         logging.error(f"Failed to connect to database: {e}")
         raise
 
+
 # Update task status, status detail, and status time in the database
 def update_task_status(iso, adm, status, detail=None):
     try:
         with connect_to_db() as conn:
             with conn.cursor() as cur:
-                cur.execute("""
+                cur.execute(
+                    """
                     UPDATE Tasks
                     SET status = %s, status_detail = %s, status_time = NOW()
                     WHERE ISO = %s AND ADM = %s;
-                """, (status, detail, iso.upper(), adm.upper()))
+                """,
+                    (status, detail, iso.upper(), adm.upper()),
+                )
                 conn.commit()
-                logging.info(f"Task {iso.upper()}_{adm.upper()} marked as '{status}' with details: {detail}.")
+                logging.info(
+                    f"Task {iso.upper()}_{adm.upper()} marked as '{status}' with details: {detail}."
+                )
     except Exception as e:
-        logging.error(f"Error updating task status for {iso.upper()}_{adm.upper()}: {e}")
+        logging.error(
+            f"Error updating task status for {iso.upper()}_{adm.upper()}: {e}"
+        )
+
 
 # Get count of running worker pods
 def get_running_pods_count():
     try:
         k8s_client = client.CoreV1Api()
-        pods = k8s_client.list_namespaced_pod(namespace=NAMESPACE, label_selector="app=worker")
-        running_pods = len([pod for pod in pods.items if pod.status.phase in ["Pending", "Running"]])
+        pods = k8s_client.list_namespaced_pod(
+            namespace=NAMESPACE, label_selector="app=worker"
+        )
+        running_pods = len(
+            [pod for pod in pods.items if pod.status.phase in ["Pending", "Running"]]
+        )
         logging.debug(f"Running pods count: {running_pods}")
         return running_pods
     except Exception as e:
         logging.error(f"Error getting running pods count: {e}")
         return 0
 
+
 # Monitor worker pod status and update task status if it fails
 def monitor_worker_pods():
     global failed_pod_count
     try:
         k8s_client = client.CoreV1Api()
-        pods = k8s_client.list_namespaced_pod(namespace=NAMESPACE, label_selector="app=worker")
+        pods = k8s_client.list_namespaced_pod(
+            namespace=NAMESPACE, label_selector="app=worker"
+        )
 
         for pod in pods.items:
             pod_name = pod.metadata.name
@@ -114,7 +138,10 @@ def monitor_worker_pods():
             # Get completion time for completed pods
             if pod_status == "Succeeded" and pod.status.container_statuses:
                 container_state = pod.status.container_statuses[0].state
-                if hasattr(container_state, 'terminated') and container_state.terminated:
+                if (
+                    hasattr(container_state, "terminated")
+                    and container_state.terminated
+                ):
                     completion_time = container_state.terminated.finished_at
 
             # Handle failed pods
@@ -123,8 +150,12 @@ def monitor_worker_pods():
                 _, iso, adm = pod_name.split("-")
                 try:
                     # Fetch pod logs
-                    log = k8s_client.read_namespaced_pod_log(name=pod_name, namespace=NAMESPACE)
-                    logging.warning(f"Worker pod {pod_name} failed. Updating task {iso.upper()}_{adm.upper()} to 'ERROR'.")
+                    log = k8s_client.read_namespaced_pod_log(
+                        name=pod_name, namespace=NAMESPACE
+                    )
+                    logging.warning(
+                        f"Worker pod {pod_name} failed. Updating task {iso.upper()}_{adm.upper()} to 'ERROR'."
+                    )
                     update_task_status(iso, adm, "ERROR", detail=log)
 
                     # Increment failed pod count
@@ -135,23 +166,34 @@ def monitor_worker_pods():
                     k8s_client.delete_namespaced_pod(name=pod_name, namespace=NAMESPACE)
                     logging.info(f"Deleted failed pod {pod_name}.")
                 except Exception as e:
-                    logging.error(f"Error fetching logs or deleting pod {pod_name}: {e}")
+                    logging.error(
+                        f"Error fetching logs or deleting pod {pod_name}: {e}"
+                    )
 
             # Handle completed pods
             elif pod_status == "Succeeded" and completion_time:
                 # Check if pod has been completed for more than 5 minutes
-                if datetime.now(completion_time.tzinfo) - completion_time > timedelta(minutes=5):
+                if datetime.now(completion_time.tzinfo) - completion_time > timedelta(
+                    minutes=5
+                ):
                     try:
-                        k8s_client.delete_namespaced_pod(name=pod_name, namespace=NAMESPACE)
-                        logging.info(f"Deleted completed pod {pod_name} after 5 minutes.")
+                        k8s_client.delete_namespaced_pod(
+                            name=pod_name, namespace=NAMESPACE
+                        )
+                        logging.info(
+                            f"Deleted completed pod {pod_name} after 5 minutes."
+                        )
                     except Exception as e:
                         logging.error(f"Error deleting completed pod {pod_name}: {e}")
 
         if failed_pod_count >= MAX_FAILED_PODS:
-            logging.critical(f"Maximum failed pods reached ({failed_pod_count}). Stopping task controller.")
+            logging.critical(
+                f"Maximum failed pods reached ({failed_pod_count}). Stopping task controller."
+            )
             exit(1)
     except Exception as e:
         logging.error(f"Error in monitor_worker_pods: {e}")
+
 
 # Get a task with status 'ready' and mark it as 'working'
 def get_and_mark_ready_task():
@@ -170,13 +212,18 @@ def get_and_mark_ready_task():
                 if task:
                     # Mark the task as 'working'
                     taskid, iso, adm, filesize = task
-                    cur.execute("""
+                    cur.execute(
+                        """
                         UPDATE Tasks
                         SET status = 'working', status_time = NOW()
                         WHERE taskid = %s;
-                    """, (taskid,))
+                    """,
+                        (taskid,),
+                    )
                     conn.commit()
-                    logging.info(f"Task {iso.upper()}_{adm.upper()} marked as 'working'.")
+                    logging.info(
+                        f"Task {iso.upper()}_{adm.upper()} marked as 'working'."
+                    )
                     return task
                 else:
                     logging.info("No ready tasks found.")
@@ -184,6 +231,7 @@ def get_and_mark_ready_task():
     except Exception as e:
         logging.error(f"Error while fetching and updating tasks: {e}")
         return None
+
 
 # Create a Worker Pod
 def create_worker_pod(iso, adm, filesize, taskid):
@@ -196,13 +244,12 @@ def create_worker_pod(iso, adm, filesize, taskid):
             metadata=client.V1ObjectMeta(
                 name=f"worker-{iso.lower()}-{adm.lower()}".lower(),
                 namespace=NAMESPACE,
-                labels={"app": "worker"}
+                labels={"app": "worker"},
             ),
             spec=client.V1PodSpec(
                 restart_policy="Never",
                 security_context=client.V1PodSecurityContext(
-                    run_as_user=71032,
-                    run_as_group=9915
+                    run_as_user=71032, run_as_group=9915
                 ),
                 containers=[
                     client.V1Container(
@@ -220,8 +267,7 @@ def create_worker_pod(iso, adm, filesize, taskid):
                         ],
                         volume_mounts=[
                             client.V1VolumeMount(
-                                mount_path="/sciclone",
-                                name="nfs-mount"
+                                mount_path="/sciclone", name="nfs-mount"
                             )
                         ],
                         resources=client.V1ResourceRequirements(
@@ -234,19 +280,23 @@ def create_worker_pod(iso, adm, filesize, taskid):
                     client.V1Volume(
                         name="nfs-mount",
                         nfs=client.V1NFSVolumeSource(
-                            server="128.239.59.144",
-                            path="/sciclone"
-                        )
+                            server="128.239.59.144", path="/sciclone"
+                        ),
                     )
                 ],
             ),
         )
 
         k8s_client.create_namespaced_pod(namespace=NAMESPACE, body=pod_manifest)
-        logging.info(f"Created worker pod for task: ISO={iso.upper()}, ADM={adm.upper()}, Memory={memory_request}Mi")
+        logging.info(
+            f"Created worker pod for task: ISO={iso.upper()}, ADM={adm.upper()}, Memory={memory_request}Mi"
+        )
     except Exception as e:
-        logging.error(f"Failed to create worker pod for task: ISO={iso.upper()}, ADM={adm.upper()}. Error: {e}")
+        logging.error(
+            f"Failed to create worker pod for task: ISO={iso.upper()}, ADM={adm.upper()}. Error: {e}"
+        )
         update_task_status(iso, adm, "ERROR", detail=str(e))
+
 
 # Main Loop
 def main():
@@ -272,9 +322,16 @@ def main():
                             WHERE "STATUS_TYPE" = 'WORKER_OP_HEARTBEAT'
                             """
                             # Calculate time to next status check
-                            time_to_next_status = 60 - (current_time - last_status_update_time).total_seconds()
+                            time_to_next_status = (
+                                60
+                                - (
+                                    current_time - last_status_update_time
+                                ).total_seconds()
+                            )
                             heartbeat_status = f"Next worker status update in: {max(0, time_to_next_status):.2f} seconds"
-                            cur.execute(heartbeat_query, (current_time, heartbeat_status))
+                            cur.execute(
+                                heartbeat_query, (current_time, heartbeat_status)
+                            )
                             heartbeat_conn.commit()
 
                     last_heartbeat_time = current_time
@@ -304,13 +361,16 @@ def main():
                             twentyfour_hours_ago = current_time - timedelta(hours=24)
 
                             # Execute count query
-                            cur.execute("""
+                            cur.execute(
+                                """
                                 SELECT
                                     COUNT(*) FILTER (WHERE status = 'COMPLETE') as successful_tasks,
                                     COUNT(*) FILTER (WHERE status = 'ERROR') as failed_tasks
                                 FROM Tasks
                                 WHERE status_time >= %s
-                            """, (twentyfour_hours_ago,))
+                            """,
+                                (twentyfour_hours_ago,),
+                            )
                             successful_tasks, failed_tasks = cur.fetchone()
 
                             # Prepare status message
@@ -321,11 +381,10 @@ def main():
                             )
 
                             # Update status
-                            cur.execute(status_query, (
-                                twentyfour_hours_ago,
-                                current_time,
-                                status_message
-                            ))
+                            cur.execute(
+                                status_query,
+                                (twentyfour_hours_ago, current_time, status_message),
+                            )
                             status_conn.commit()
 
                     last_status_update_time = current_time
@@ -352,6 +411,7 @@ def main():
         except Exception as e:
             logging.error(f"Error in main loop: {e}")
             time.sleep(30)  # Wait before retrying to prevent rapid error loops
+
 
 if __name__ == "__main__":
     main()

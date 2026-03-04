@@ -168,7 +168,6 @@ def process_geometries(log, args):
 
 
 def process_geometry(args, g, adm0str, adm1str, adm2str):
-
     curISO = g["ISO_CODE"].values[0]
 
     DTA_A0Path = outPath + "ADM0_" + curISO + ".geojson"

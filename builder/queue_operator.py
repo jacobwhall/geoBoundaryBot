@@ -14,9 +14,11 @@ os.makedirs(log_dir, exist_ok=True)
 log_file = os.path.join(log_dir, "queue_operator.log")
 
 # Configure logging
-logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s - %(levelname)s - %(message)s',
-                    handlers=[logging.FileHandler(log_file)])
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.FileHandler(log_file)],
+)
 
 # Database Configuration
 DB_SERVICE = "geoboundaries-postgres-service"
@@ -40,11 +42,11 @@ def connect_to_db(max_attempts=10, retry_delay=15):
     for attempt in range(1, max_attempts + 1):
         try:
             conn = psycopg2.connect(
-                dbname=os.environ.get('DB_NAME', 'geoboundaries'),
-                user=os.environ.get('DB_USER', 'postgres'),
-                password=os.environ.get('DB_PASSWORD', ''),
-                host=os.environ.get('DB_SERVICE', 'localhost'),
-                port=os.environ.get('DB_PORT', '5432')
+                dbname=os.environ.get("DB_NAME", "geoboundaries"),
+                user=os.environ.get("DB_USER", "postgres"),
+                password=os.environ.get("DB_PASSWORD", ""),
+                host=os.environ.get("DB_SERVICE", "localhost"),
+                port=os.environ.get("DB_PORT", "5432"),
             )
             logging.info("Database connection established.")
             return conn
@@ -100,18 +102,34 @@ def populate_tasks_table(conn):
                     task_id = str(uuid.uuid4())  # Generate a unique task ID
 
                     # Check if any READY tasks exist for this ISO/ADM combination
-                    check_query = sql.SQL("SELECT COUNT(*) FROM Tasks WHERE ISO = %s AND ADM = %s AND status = 'ready'")
+                    check_query = sql.SQL(
+                        "SELECT COUNT(*) FROM Tasks WHERE ISO = %s AND ADM = %s AND status = 'ready'"
+                    )
                     cur.execute(check_query, (iso, adm))
                     ready_count = cur.fetchone()[0]
 
                     if ready_count > 0:
-                        logging.info(f"Record for ISO: {iso}, ADM: {adm} already has a ready task. Skipping insertion.")
+                        logging.info(
+                            f"Record for ISO: {iso}, ADM: {adm} already has a ready task. Skipping insertion."
+                        )
                         continue  # Skip to the next file
 
                     # Prepare batch insert
-                    tasks_to_insert.append((task_id, iso, adm, datetime.now(), file_size, "ready", datetime.now()))
+                    tasks_to_insert.append(
+                        (
+                            task_id,
+                            iso,
+                            adm,
+                            datetime.now(),
+                            file_size,
+                            "ready",
+                            datetime.now(),
+                        )
+                    )
                     tasks_added += 1
-                    logging.info(f"Task {task_id} for {filename} prepared for batch insert.")
+                    logging.info(
+                        f"Task {task_id} for {filename} prepared for batch insert."
+                    )
 
                 except Exception as e:
                     logging.error(f"Error processing file {filename}: {e}")
@@ -202,7 +220,9 @@ if __name__ == "__main__":
                         SET "TIME" = %s, "STATUS" = %s
                         WHERE "STATUS_TYPE" = 'QUEUE_STATUS'
                         """
-                        status_message = f"Database population completed. Tasks added: {tasks_added}"
+                        status_message = (
+                            f"Database population completed. Tasks added: {tasks_added}"
+                        )
                         cur.execute(status_query, (current_time, status_message))
                     conn.commit()
                     # Update last queue population time
