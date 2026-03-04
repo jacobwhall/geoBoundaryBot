@@ -14,7 +14,7 @@ def initiateWorkspace(check, build = None):
             ws['working'] = "/home/dan/git/geoBoundaries"
             ws['logPath'] = os.path.expanduser("~") + "/tmp/" + str(check) + "_buildStatus.csv"
 
-        print("Python WD: " + ws['working'])  
+        print("Python WD: " + ws['working'])
         print("Logging Path: " + str(ws["logPath"]))
         ws['zips'] = []
 
@@ -30,7 +30,7 @@ def initiateWorkspace(check, build = None):
             ws['logPath'] = os.path.expanduser("~") + "/tmp/" + str(check) + ".txt"
             ws['zips'] = list(filter(lambda x: x[-4:] == '.zip', ws["changedFiles"]))
 
-        print("Python WD: " + ws['working'])  
+        print("Python WD: " + ws['working'])
         print("Python changedFiles: " + str(ws['changedFiles']))
         print("Logging Path: " + str(ws["logPath"]))
         print("Changed Zips Detected: " + str(ws['zips']))
@@ -60,7 +60,7 @@ def checkRetrieveLFSFiles(z, workingDir="./"):
             print("--------------------------------")
             print("Downloading LFS File (file > 25mb): " + z)
             os.system('git lfs pull --include=\"' + z +'\"')
-            
+
         else:
             #print("")
             #print("--------------------------------")
@@ -93,13 +93,13 @@ def citationUse(releaseType):
     citUse = citUse + "geolab.wm.edu \n"
     citUse = citUse + "The geoBoundaries database is made available in a \n"
     citUse = citUse + "variety of software formats to support GIS software programs.\n"
-    
+
     if(releaseType == "gbOpen"):
         citUse = citUse + "This file is a part of the geoBoundaries Open Database \n"
         citUse = citUse + "(gbOpen).  All boundaries in this database are open and \n"
         citUse = citUse + "redistributable, and are released alongside extensive metadata \n"
         citUse = citUse + "and licence information to help inform end users. \n"
-    
+
     else:
         citUse = citUse + "This file is a part of a geoBoundaries Mixed Database. \n"
         citUse = citUse + "All boundaries in this database are \n"
@@ -109,7 +109,7 @@ def citationUse(releaseType):
         citUse = citUse + "information in this database may have restrictions on (for example) \n"
         citUse = citUse + "commercial use.  Users should carefully read each license to ensure they are \n"
         citUse = citUse + "not violating the terms of an individual layer for any non-private uses. \n"
-    
+
     citUse = citUse + "We update geoBoundaries on a yearly cycle, \n"
     citUse = citUse + "with new versions in or around August of each calendar \n"
     citUse = citUse + "year; old versions remain accessible at www.geoboundaries.org. \n"
@@ -165,7 +165,7 @@ def citationUse(releaseType):
     citUse = citUse + "With respect to the works on or made available\n"
     citUse = citUse + "through download from www.geoboundaries.org,\n"
     citUse = citUse + "we make no representations or warranties—express, implied, or statutory—as\n"
-    citUse = citUse + "to the validity, accuracy, completeness, or fitness for a particular purpose;\n" 
+    citUse = citUse + "to the validity, accuracy, completeness, or fitness for a particular purpose;\n"
     citUse = citUse + "nor represent that use of such works would not infringe privately owned rights;\n"
     citUse = citUse + "nor assume any liability resulting from use of such works; and shall in no way\n"
     citUse = citUse + "be liable for any costs, expenses, claims, or demands arising out of use of such works.\n"
@@ -177,4 +177,3 @@ def citationUse(releaseType):
     citUse = citUse + "-Dan Runfola (github.com/DanRunfola ; danr@wm.edu)"
 
     return(citUse)
-

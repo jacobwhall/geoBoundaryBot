@@ -1,9 +1,9 @@
 import os
 import sys
-import gbHelpers
-import gbDataCheck
+from utils import helpers as gbHelpers
+from utils import data_check as gbDataCheck
 import zipfile
-import gbMetaCheck
+from utils import meta_check as gbMetaCheck
 import csv
 import json
 from distutils.dir_util import copy_tree

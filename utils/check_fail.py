@@ -1,5 +1,5 @@
 import os
-import gbHelpers
+from . import helpers as gbHelpers
 import sys
 
 check = gbHelpers.gbEnvVars("RESULT", "", "r")

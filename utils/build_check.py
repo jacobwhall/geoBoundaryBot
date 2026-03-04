@@ -11,7 +11,7 @@ key = str(sys.argv[1])
 
 print(os.environ['GITHUB_WORKSPACE'])
 
-def run_query(query, key): 
+def run_query(query, key):
     try:
         headers = {"Authorization": "Bearer %s" % key}
         request = requests.post('https://api.github.com/graphql', json={'query': query}, headers=headers)
@@ -27,7 +27,7 @@ def findDate(queryResponse):
         else:
             if(recentDate < curDate):
                 recentDate = curDate
-    
+
     return(recentDate)
 
 sourceQuery = """
@@ -121,4 +121,3 @@ except:
 if(sysExit == 1):
     annotationPayload = "Build is already up to date."
     sys.exit(annotationPayload)
-
