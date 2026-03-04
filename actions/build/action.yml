@@ -1,0 +1,52 @@
+name: 'geoBoundaryBot Build'
+description: 'Run the geoBoundaries build pipeline for a specific boundary'
+
+inputs:
+  build-type:
+    description: 'Release type (e.g., gbOpen, gbHumanitarian, gbAuthoritative)'
+    required: true
+  build-ver:
+    description: 'Build version: nightly or release'
+    required: true
+    default: 'nightly'
+  countries:
+    description: 'Comma-separated ISO country codes to process'
+    required: true
+  adm-level:
+    description: 'Boundary type filter (e.g., ADM0, ADM1)'
+    required: true
+  api-key:
+    description: 'GitHub API token for GraphQL queries and issue creation'
+    required: true
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Link bot repo for dta/ path compatibility
+      shell: bash
+      run: ln -sfn "${{ github.action_path }}/../.." "$GITHUB_WORKSPACE/geoBoundaryBot"
+
+    - name: Create working directories
+      shell: bash
+      run: mkdir -p ~/tmp ~/artifacts ~/working
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v7
+
+    - name: Install dependencies
+      shell: bash
+      working-directory: ${{ github.action_path }}/../..
+      run: uv sync --locked
+
+    - name: Run build
+      shell: bash
+      env:
+        PYTHONPATH: ${{ github.action_path }}/../..
+        GITHUB_TOKEN: ${{ inputs.api-key }}
+      run: |
+        uv --project "${{ github.action_path }}/../.." run python -m main \
+          --build-type "${{ inputs.build-type }}" \
+          --build-ver "${{ inputs.build-ver }}" \
+          --countries "${{ inputs.countries }}" \
+          --type-query "${{ inputs.adm-level }}" \
+          --api-key "${{ inputs.api-key }}"

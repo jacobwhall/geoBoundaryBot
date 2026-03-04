@@ -1,0 +1,44 @@
+name: 'geoBoundaryBot Check'
+description: 'Run zip, metadata, or geometry data checks on geoBoundary submissions'
+
+inputs:
+  check-type:
+    description: 'Type of check to run: zip, meta, or data'
+    required: true
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Link bot repo for dta/ path compatibility
+      shell: bash
+      run: ln -sfn "${{ github.action_path }}/../.." "$GITHUB_WORKSPACE/geoBoundaryBot"
+
+    - name: Create working directories
+      shell: bash
+      run: mkdir -p ~/tmp tmp
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v7
+
+    - name: Install dependencies
+      shell: bash
+      working-directory: ${{ github.action_path }}/../..
+      run: uv sync --locked
+
+    - name: Run check
+      shell: bash
+      env:
+        PYTHONPATH: ${{ github.action_path }}/../..
+      run: |
+        case "${{ inputs.check-type }}" in
+          zip)  uv --project "${{ github.action_path }}/../.." run python -m utils.zip_check ;;
+          meta) uv --project "${{ github.action_path }}/../.." run python -m utils.meta_check ;;
+          data) uv --project "${{ github.action_path }}/../.." run python -m utils.data_check ;;
+          *)    echo "::error::Unknown check-type: ${{ inputs.check-type }}"; exit 1 ;;
+        esac
+
+    - name: Evaluate check result
+      shell: bash
+      env:
+        PYTHONPATH: ${{ github.action_path }}/../..
+      run: uv --project "${{ github.action_path }}/../.." run python -m utils.check_fail

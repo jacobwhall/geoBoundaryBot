@@ -1,0 +1,45 @@
+name: 'geoBoundaryBot PR Response'
+description: 'Generate PR response text from check results'
+
+inputs:
+  gitsha:
+    description: 'Git SHA of the PR head, used for artifact URL construction'
+    required: true
+
+outputs:
+  response-text:
+    description: 'The generated PR response markdown'
+    value: ${{ steps.respond.outputs.response_text }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Link bot repo for compatibility
+      shell: bash
+      run: ln -sfn "${{ github.action_path }}/../.." "$GITHUB_WORKSPACE/geoBoundaryBot"
+
+    - name: Create working directories
+      shell: bash
+      run: mkdir -p ~/tmp
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v7
+
+    - name: Install dependencies
+      shell: bash
+      working-directory: ${{ github.action_path }}/../..
+      run: uv sync --locked
+
+    - name: Generate response
+      id: respond
+      shell: bash
+      env:
+        PYTHONPATH: ${{ github.action_path }}/../..
+        gitsha: ${{ inputs.gitsha }}
+      run: |
+        uv --project "${{ github.action_path }}/../.." run python -m utils.response
+        {
+          echo "response_text<<GHEOF"
+          cat ~/tmp/response.txt
+          echo "GHEOF"
+        } >> "$GITHUB_OUTPUT"
