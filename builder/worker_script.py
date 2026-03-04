@@ -68,21 +68,21 @@ def update_status_in_db(status_type, status, timestamp):
     try:
         # Initialize source_date
         source_date = None
-        
+
         # Extract ISO and ADM from status_type
         parts = status_type.split('_')
         logging.info(f"Status type parts: {parts}")
-        
+
         if len(parts) >= 3 and parts[1].startswith('ADM'):
             iso = parts[0]
             adm = parts[1]
             logging.info(f"Processing ISO: {iso}, ADM: {adm}")
-            
+
             # List possible metadata paths
             possible_paths = [
                 f"/sciclone/geograd/geoBoundaries/database/geoBoundariesDev/releaseData/gbOpen/{iso}/{adm}/geoBoundaries-{iso}-{adm}-metaData.json"
             ]
-            
+
             for meta_path in possible_paths:
                 logging.info(f"Checking metadata path: {meta_path}")
                 if os.path.exists(meta_path):
@@ -91,7 +91,7 @@ def update_status_in_db(status_type, status, timestamp):
                         # Try different encodings if needed
                         encodings = ['utf-8', 'latin-1', 'cp1252']
                         content = None
-                        
+
                         for encoding in encodings:
                             try:
                                 with open(meta_path, 'r', encoding=encoding) as f:
@@ -101,13 +101,13 @@ def update_status_in_db(status_type, status, timestamp):
                             except UnicodeDecodeError:
                                 logging.warning(f"Failed to read file with encoding: {encoding}")
                                 continue
-                        
+
                         if content is None:
                             logging.error(f"Could not read file with any encoding: {meta_path}")
                             continue
-                        
+
                         logging.info(f"Metadata content: {content[:200]}...")  # Log first 200 chars
-                        
+
                         try:
                             # Try to parse as JSON
                             meta_data = json.loads(content)
@@ -128,7 +128,7 @@ def update_status_in_db(status_type, status, timestamp):
                                             break
                                         except ValueError:
                                             continue
-                                    
+
                                     # If none of the formats worked, try a manual approach for common formats
                                     if not source_date:
                                         try:
@@ -151,7 +151,7 @@ def update_status_in_db(status_type, status, timestamp):
                                 except Exception as e:
                                     logging.warning(f"Error parsing source date '{source_date_str}': {e}")
                             continue  # Skip the rest of the JSON processing
-                        
+
                         # First check for sourceDataUpdateDate field directly
                         if 'sourceDataUpdateDate' in meta_data:
                             source_date_str = meta_data.get('sourceDataUpdateDate')
@@ -165,7 +165,7 @@ def update_status_in_db(status_type, status, timestamp):
                                         break
                                     except ValueError:
                                         continue
-                                
+
                                 # If none of the formats worked, try a manual approach for common formats
                                 if not source_date:
                                     try:
@@ -187,7 +187,7 @@ def update_status_in_db(status_type, status, timestamp):
                                         logging.warning(f"Error in manual date parsing: {e}")
                             except Exception as e:
                                 logging.warning(f"Error parsing source date '{source_date_str}': {e}")
-                        
+
                         # If sourceDataUpdateDate not found, try other possible date fields
                         if not source_date:
                             date_fields = ['sourceDate', 'sourceDataDate', 'lastUpdated', 'date']
@@ -204,7 +204,7 @@ def update_status_in_db(status_type, status, timestamp):
                                                 break
                                             except ValueError:
                                                 continue
-                                        
+
                                         # If none of the formats worked, try a manual approach for common formats
                                         if not source_date:
                                             try:
@@ -228,45 +228,45 @@ def update_status_in_db(status_type, status, timestamp):
                                             break
                                     except Exception as e:
                                         logging.warning(f"Error parsing source date '{source_date_str}': {e}")
-                        
+
                         if source_date:
                             break  # Exit the file loop if we found a date
                     except Exception as e:
                         logging.warning(f"Error reading metadata file {meta_path}: {e}")
                 else:
                     logging.info(f"Metadata file not found at: {meta_path}")
-        
+
         with connect_to_db() as conn:
             with conn.cursor() as cur:
                 # First, try to alter table to add SOURCE_DATE column if it doesn't exist
                 try:
                     cur.execute("""
-                        ALTER TABLE worker_status 
+                        ALTER TABLE worker_status
                         ADD COLUMN IF NOT EXISTS "SOURCE_DATE" TIMESTAMP WITH TIME ZONE
                     """)
                     conn.commit()
                 except Exception as e:
                     logging.warning(f"Could not add SOURCE_DATE column: {e}")
                     conn.rollback()
-                
+
                 # Debug log the values being inserted
                 logging.info(f"Inserting values - STATUS_TYPE: {status_type}, STATUS: {status}, TIME: {timestamp}, SOURCE_DATE: {source_date}")
-                
+
                 # Upsert query including SOURCE_DATE
                 upsert_query = """
-                INSERT INTO worker_status ("STATUS_TYPE", "STATUS", "TIME", "SOURCE_DATE") 
+                INSERT INTO worker_status ("STATUS_TYPE", "STATUS", "TIME", "SOURCE_DATE")
                 VALUES (%s, %s, %s, %s)
-                ON CONFLICT ("STATUS_TYPE") 
-                DO UPDATE SET 
-                    "STATUS" = EXCLUDED."STATUS", 
+                ON CONFLICT ("STATUS_TYPE")
+                DO UPDATE SET
+                    "STATUS" = EXCLUDED."STATUS",
                     "TIME" = EXCLUDED."TIME",
                     "SOURCE_DATE" = EXCLUDED."SOURCE_DATE"
                 """
-                
+
                 # Execute the query and verify the result
                 cur.execute(upsert_query, (status_type, status, timestamp, source_date))
                 conn.commit()
-                
+
                 # Verify the update
                 cur.execute('SELECT "SOURCE_DATE" FROM worker_status WHERE "STATUS_TYPE" = %s', (status_type,))
                 result = cur.fetchone()
@@ -331,7 +331,7 @@ try:
 
         # Initialize builder
         bnd = builder(iso, adm, "gbOpen", GB_DIR, LOG_DIR, TMP_DIR, isoList, licenseList)
-        
+
         # Run builder stages
         stages = [
             ("checkExistence", "CHECKING_EXISTENCE"),
@@ -340,7 +340,7 @@ try:
             ("checkBuildGeometryFiles", "PROCESSING_GEOMETRY"),
             ("calculateGeomMeta", "CALCULATING_GEOMETRY_META")
         ]
-        
+
         # Force rebuild by setting changesDetected to True
         bnd.changesDetected = True
         stages.append(("constructFiles", "CONSTRUCTING_FILES"))
@@ -348,11 +348,11 @@ try:
         for stage_method, stage_status in stages:
             logging.info(f"Running stage: {stage_method}")
             update_status_in_db(status_type, stage_status, datetime.now())
-            
+
             # Call the stage method dynamically
             method = getattr(bnd, stage_method)
             result = method()
-            
+
             if "ERROR" in str(result):
                 logging.error(f"Error in {stage_method}: {result}")
                 update_status_in_db(status_type, f"ERROR_{stage_status}", datetime.now())
@@ -373,10 +373,10 @@ try:
         else:
             # If all stages complete successfully
             build_results.append([iso, adm, "gbOpen", "Successfully built.", "D"])
-            
+
             # Calculate elapsed time
             elapsed_time = format_elapsed_time(start_time)
-            
+
             # Update both worker_status and tasks tables
             with connect_to_db() as conn:
                 with conn.cursor() as cur:
@@ -398,7 +398,7 @@ try:
         logging.error(error_msg)
         error_code = "EP"  # Error Processing
         build_results.append([iso, adm, "gbOpen", str(product_error), error_code])
-        
+
         # Update both status tables
         with connect_to_db() as conn:
             with conn.cursor() as cur:
@@ -424,7 +424,7 @@ try:
         else:
             final_status = "COMPLETE"
         update_status_in_db(status_type, final_status, datetime.now())
-    
+
     # Log build results
     for result in build_results:
         logging.info(f"Build Result: {result}")

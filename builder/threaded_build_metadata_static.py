@@ -167,15 +167,15 @@ def hash_meta(meta: dict) -> str:
     """Generate a hash of the metadata, including only specified fields."""
     # Define the fields to include in the hash
     included_fields = [
-        'boundaryISO', 'boundaryType', 'boundaryID', 'boundaryYear', 
-        'boundarySource', 'boundaryCanonical', 'boundaryLicense', 
-        'licenseDetail', 'licenseSource', 'boundarySourceURL', 
+        'boundaryISO', 'boundaryType', 'boundaryID', 'boundaryYear',
+        'boundarySource', 'boundaryCanonical', 'boundaryLicense',
+        'licenseDetail', 'licenseSource', 'boundarySourceURL',
         'admUnitCount', 'meanAreaSqKM'
     ]
-    
+
     # Create a new dict with only the included fields
     meta_filtered = {k: meta.get(k) for k in included_fields if k in meta}
-    
+
     # Normalize and hash the filtered metadata
     meta_norm = normalize_meta_dict(meta_filtered)
     meta_str = json.dumps(meta_norm, sort_keys=True)
@@ -253,7 +253,7 @@ def process_metadata(args):
         with open(json_path, encoding='utf-8', mode="r") as j:
             meta = json.load(j)
         json_load_time = time.time() - json_load_start
-        
+
         # Timing: ISO lookup
         iso_lookup_start = time.time()
         isoMeta = isoDetails[isoDetails["Alpha-3code"] == meta['boundaryISO']]
@@ -261,7 +261,7 @@ def process_metadata(args):
         if isoMeta.empty:
             with log_lock:
                 logging.error(f"isoMeta lookup failed: path={path}, meta['boundaryISO']={meta.get('boundaryISO')}, isoMeta is empty. isoDetails Alpha-3code values: {isoDetails['Alpha-3code'].unique()}")
-        
+
         # Timing: String processing and metadata line building
         string_processing_start = time.time()
         try:
@@ -301,7 +301,7 @@ def process_metadata(args):
         else:
             need_copy = True
         file_check_time = time.time() - file_check_start
-        
+
         # Timing: File copying (if needed)
         file_copy_start = time.time()
         if need_copy:
@@ -436,7 +436,7 @@ def main():
     start_time = time.time()
     with log_lock:
         logging.info("=== METADATA STATIC BUILD STARTED ===")
-    
+
     # Step 1: Check for ready tasks
     step1_start = time.time()
     ready_count = get_ready_task_count()
@@ -559,7 +559,7 @@ def main():
     stop_status_thread.set()
     status_thread.join(timeout=10)
     cleanup_time = time.time() - cleanup_start
-    
+
     total_time = time.time() - start_time
     with log_lock:
         logging.info(f"TIMING: Final cleanup took {cleanup_time:.2f} seconds")

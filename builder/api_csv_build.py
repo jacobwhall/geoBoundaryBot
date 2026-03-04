@@ -61,16 +61,16 @@ def to_camel_case(snake_str: str) -> str:
         'sqkm': 'SqKM',
         'km': 'KM'
     }
-    
+
     # Check for special cases
     lower_str = snake_str.lower()
     if lower_str in special_cases:
         return special_cases[lower_str]
-    
+
     # Handle boundarySource, boundaryType, etc.
     if snake_str.startswith('boundary'):
         return 'boundary' + snake_str[8:].title()
-    
+
     # For other fields, convert to camelCase
     components = snake_str.split('_')
     return components[0].lower() + ''.join(x.title() for x in components[1:])
@@ -79,15 +79,15 @@ def convert_db_row_to_api_format(row: dict) -> dict:
     """Convert a database row to API format with proper field names and structure."""
     if not row:
         return {}
-    
+
     # Base URL for downloads
     base_url = "https://www.geoboundaries-dev.org/data/current/gbOpen"
-    
+
     # Extract base fields
     boundary_id = row.get('boundaryid', '')
     boundary_iso = row.get('boundaryiso', '')
     boundary_type = row.get('boundarytype', '').upper()
-    
+
     # Create the output dictionary with all required fields
     result = {
         "boundaryID": boundary_id,
@@ -126,7 +126,7 @@ def convert_db_row_to_api_format(row: dict) -> dict:
         "minAreaSqKM": str(row.get('minareasqkm', '')),
         "maxAreaSqKM": str(row.get('maxareasqkm', '')),
     }
-    
+
     # Add download URLs if we have the required fields
     if boundary_iso and boundary_type:
         base_path = f"{boundary_iso}/{boundary_type}/geoBoundaries-{boundary_iso}-{boundary_type}"
@@ -134,7 +134,7 @@ def convert_db_row_to_api_format(row: dict) -> dict:
         static_download = row.get('staticdownloadlink')
         if not static_download:
             static_download = f"{base_url}/{base_path}-all.zip"
-            
+
         result.update({
             "staticDownloadLink": static_download,
             "gjDownloadURL": f"{base_url}/{base_path}.geojson",
@@ -142,12 +142,12 @@ def convert_db_row_to_api_format(row: dict) -> dict:
             "imagePreview": f"{base_url}/{base_path}-PREVIEW.png",
             "simplifiedGeometryGeoJSON": f"{base_url}/{base_path}_simplified.geojson"
         })
-    
+
     # Handle None/NaN values
     for key, value in result.items():
         if pd.isna(value) or value is None:
             result[key] = ""
-            
+
     return result
 
 def convert_datetime_to_iso(obj: Any) -> Any:
@@ -192,11 +192,11 @@ def build_api_index_json():
                 cur.execute("SELECT DISTINCT boundaryiso FROM boundary_meta WHERE boundaryiso IS NOT NULL")
                 iso_rows = cur.fetchall()
                 all_isos = [row["boundaryiso"] for row in iso_rows if row and "boundaryiso" in row and row["boundaryiso"]]
-                
+
                 if not all_isos:
                     with log_lock:
                         logging.warning("No boundaryISO values found in boundary_meta table")
-                
+
                 for iso in all_isos:
                     try:
                         # Get all records for this ISO
@@ -204,7 +204,7 @@ def build_api_index_json():
                         rows = cur.fetchall()
                         if not rows:
                             continue
-                            
+
                         # Create ISO/ALL/index.json
                         iso_rows = [convert_datetime_to_iso(convert_db_row_to_api_format(row)) for row in rows]
                         out_dir = os.path.join(apiPath, str(iso), "ALL")
@@ -212,7 +212,7 @@ def build_api_index_json():
                         out_path = os.path.join(out_dir, "index.json")
                         with open(out_path, "w", encoding="utf-8") as f:
                             json.dump(iso_rows, f, ensure_ascii=False, indent=2)
-                        
+
                         # Create ISO/ADM*/index.json for each ADM level
                         for adm in adm_levels:
                             try:
@@ -221,24 +221,24 @@ def build_api_index_json():
                                     (row for row in rows if row.get("boundarytype", "").upper() == adm),
                                     None
                                 )
-                                
+
                                 if not adm_row:
                                     continue
-                                    
+
                                 # Convert to API format and handle datetime/Decimal
                                 adm_data = convert_datetime_to_iso(convert_db_row_to_api_format(adm_row))
-                                
+
                                 adm_dir = os.path.join(apiPath, str(iso), adm)
                                 os.makedirs(adm_dir, exist_ok=True)
                                 adm_path = os.path.join(adm_dir, "index.json")
                                 with open(adm_path, "w", encoding="utf-8") as f:
                                     # Dump single object without array brackets
                                     json.dump(adm_data, f, ensure_ascii=False, indent=2)
-                                    
+
                             except Exception as adm_error:
                                 with log_lock:
                                     logging.error(f"Error processing {iso}/{adm}: {str(adm_error)}")
-                                    
+
                     except Exception as e:
                         with log_lock:
                             logging.error(f"Error processing ISO {iso}: {str(e)}")

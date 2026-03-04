@@ -16,7 +16,7 @@ log_file = os.path.join(log_dir, "git_operator.log")
 handler = TimedRotatingFileHandler(log_file, when='midnight', interval=1)
 handler.suffix = "%Y-%m-%d.log"
 logging.basicConfig(
-    level=logging.INFO, 
+    level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S %Z',
     handlers=[handler]
@@ -40,7 +40,7 @@ def connect_to_db():
     """Establishes a connection to the PostGIS database with retry mechanism."""
     max_retries = 5
     base_delay = 1  # Initial delay in seconds
-    
+
     for attempt in range(max_retries):
         try:
             conn = psycopg2.connect(
@@ -66,7 +66,7 @@ def connect_to_db():
 def log_subprocess_output(cmd, result, log_success=True, log_error=True):
     """
     Logs subprocess command output with detailed formatting.
-    
+
     Args:
         cmd (str): The command that was run
         result (subprocess.CompletedProcess): The result of subprocess.run
@@ -75,25 +75,25 @@ def log_subprocess_output(cmd, result, log_success=True, log_error=True):
     """
     # Log the command
     logging.info(f"Command executed: {cmd}")
-    
+
     # Log stdout if successful and log_success is True
     if result.stdout and log_success:
         logging.info("Command STDOUT:\n" + result.stdout.strip())
-    
+
     # Log stderr only if it contains a real error
     if result.stderr:
         # Filter out known non-error messages
         filtered_stderr = "\n".join([
-            line for line in result.stderr.strip().split("\n") 
-            if line and 
-            not line.startswith(" = [up to date]") and 
+            line for line in result.stderr.strip().split("\n")
+            if line and
+            not line.startswith(" = [up to date]") and
             "Already up to date" not in line
         ])
-        
+
         # Log stderr only if there's a real error message after filtering
         if filtered_stderr and (result.returncode != 0 or log_error):
             logging.error("Command STDERR:\n" + filtered_stderr)
-    
+
     return result.returncode == 0
 
 def git_pull():
@@ -101,14 +101,14 @@ def git_pull():
     logging.info("Starting git pull and LFS sync process...")
     start_time = datetime.now()
     overall_success = True
-    
+
     try:
         # Immediately update database to show pull is starting
         with connect_to_db() as conn:
             with conn.cursor() as cur:
                 start_status_query = """
-                UPDATE status 
-                SET "TIME" = %s, "STATUS" = %s 
+                UPDATE status
+                SET "TIME" = %s, "STATUS" = %s
                 WHERE "STATUS_TYPE" = 'GIT_PULL'
                 """
                 cur.execute(start_status_query, (start_time, "Git Pull Started"))
@@ -166,7 +166,7 @@ def git_pull():
             stderr=subprocess.PIPE,
             text=True,
         )
-        
+
         # Check LFS fetch result
         lfs_fetch_success = True
         if lfs_result.returncode != 0:
@@ -181,18 +181,18 @@ def git_pull():
 
         # Determine overall status
         status_message = "Successful git pull and LFS sync" if overall_success else "Partial or complete git sync failure"
-        
+
         # Calculate and log total runtime
         end_time = datetime.now()
         runtime = end_time - start_time
         logging.info(f"Total git sync runtime: {runtime}")
-        
+
         # Update database status
         with connect_to_db() as conn:
             with conn.cursor() as cur:
                 update_query = """
-                UPDATE status 
-                SET "TIME" = %s, "STATUS" = %s 
+                UPDATE status
+                SET "TIME" = %s, "STATUS" = %s
                 WHERE "STATUS_TYPE" = 'GIT_PULL'
                 """
                 cur.execute(update_query, (end_time, status_message))
@@ -205,8 +205,8 @@ def git_pull():
             with connect_to_db() as conn:
                 with conn.cursor() as cur:
                     update_query = """
-                    UPDATE status 
-                    SET "TIME" = %s, "STATUS" = %s 
+                    UPDATE status
+                    SET "TIME" = %s, "STATUS" = %s
                     WHERE "STATUS_TYPE" = 'GIT_PULL'
                     """
                     cur.execute(update_query, (datetime.now(), f"Git sync failed: {str(e)}"))
@@ -245,8 +245,8 @@ def check_git_pull_status():
 
                 # Check time since last processed task
                 cur.execute("""
-                    SELECT MAX(status_time) 
-                    FROM tasks 
+                    SELECT MAX(status_time)
+                    FROM tasks
                     WHERE status = 'COMPLETE'
                 """)
                 last_task_time = cur.fetchone()[0]
@@ -269,7 +269,7 @@ def check_git_pull_status():
                 # Check time since last git pull
                 cur.execute('SELECT "TIME" FROM status WHERE "STATUS_TYPE" = \'GIT_PULL\'')
                 result = cur.fetchone()
-                
+
                 if result is None:
                     # No record exists, first time running
                     git_pull()
@@ -298,10 +298,10 @@ def check_git_pull_status():
 if __name__ == "__main__":
     logging.info("Script started.")
     pull_check_interval = timedelta(hours=12)
-    
+
     while True:
         current_time = datetime.now()
-        
+
         # Get last pull time from database
         last_pull_time = None
         try:
@@ -314,23 +314,23 @@ if __name__ == "__main__":
         except Exception as e:
             logging.error(f"Error getting last pull time: {e}")
             last_pull_time = current_time  # Default to current time on error
-        
+
         # Perform git pull status check
         check_git_pull_status()
-        
+
         # Calculate time until next pull using database timestamp
         if last_pull_time:
             time_until_next_pull = pull_check_interval - (current_time - last_pull_time)
         else:
             time_until_next_pull = timedelta()
-        
+
         # Update heartbeat in database
         try:
             with connect_to_db() as conn:
                 with conn.cursor() as cur:
                     heartbeat_query = """
-                    UPDATE status 
-                    SET "TIME" = %s, "STATUS" = %s 
+                    UPDATE status
+                    SET "TIME" = %s, "STATUS" = %s
                     WHERE "STATUS_TYPE" = 'GIT_HEARTBEAT'
                     """
                     # Format time remaining, handling negative values
@@ -339,6 +339,6 @@ if __name__ == "__main__":
                     conn.commit()
         except Exception as e:
             logging.error(f"Error updating git heartbeat: {e}")
-        
+
         # Sleep to reduce CPU usage and provide consistent heartbeat
         time.sleep(15)  # 15-second heartbeat

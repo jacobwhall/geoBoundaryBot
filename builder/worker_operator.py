@@ -23,9 +23,9 @@ logging.basicConfig(
 
 # Rotate log files daily
 file_handler = TimedRotatingFileHandler(
-    log_file, 
-    when='midnight', 
-    interval=1, 
+    log_file,
+    when='midnight',
+    interval=1,
     backupCount=3  # Keep logs for 30 days
 )
 file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
@@ -78,8 +78,8 @@ def update_task_status(iso, adm, status, detail=None):
         with connect_to_db() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
-                    UPDATE Tasks 
-                    SET status = %s, status_detail = %s, status_time = NOW() 
+                    UPDATE Tasks
+                    SET status = %s, status_detail = %s, status_time = NOW()
                     WHERE ISO = %s AND ADM = %s;
                 """, (status, detail, iso.upper(), adm.upper()))
                 conn.commit()
@@ -136,7 +136,7 @@ def monitor_worker_pods():
                     logging.info(f"Deleted failed pod {pod_name}.")
                 except Exception as e:
                     logging.error(f"Error fetching logs or deleting pod {pod_name}: {e}")
-            
+
             # Handle completed pods
             elif pod_status == "Succeeded" and completion_time:
                 # Check if pod has been completed for more than 5 minutes
@@ -160,8 +160,8 @@ def get_and_mark_ready_task():
             with conn.cursor() as cur:
                 # Fetch one "ready" task
                 cur.execute("""
-                    SELECT taskid, ISO, ADM, filesize FROM Tasks 
-                    WHERE status = 'ready' 
+                    SELECT taskid, ISO, ADM, filesize FROM Tasks
+                    WHERE status = 'ready'
                     LIMIT 1
                     FOR UPDATE SKIP LOCKED;
                 """)
@@ -171,8 +171,8 @@ def get_and_mark_ready_task():
                     # Mark the task as 'working'
                     taskid, iso, adm, filesize = task
                     cur.execute("""
-                        UPDATE Tasks 
-                        SET status = 'working', status_time = NOW() 
+                        UPDATE Tasks
+                        SET status = 'working', status_time = NOW()
                         WHERE taskid = %s;
                     """, (taskid,))
                     conn.commit()
@@ -252,23 +252,23 @@ def create_worker_pod(iso, adm, filesize, taskid):
 def main():
     logging.info("Starting Task Controller...")
     load_kubernetes_config()  # Load the kubeconfig before proceeding
-    
+
     # Track time for heartbeat and status updates
     last_heartbeat_time = datetime.now()
     last_status_update_time = datetime.now()
-    
+
     while True:
         try:
             current_time = datetime.now()
-            
+
             # Update worker operator heartbeat every 15 seconds
             if (current_time - last_heartbeat_time).total_seconds() >= 15:
                 try:
                     with connect_to_db() as heartbeat_conn:
                         with heartbeat_conn.cursor() as cur:
                             heartbeat_query = """
-                            UPDATE status 
-                            SET "TIME" = %s, "STATUS" = %s 
+                            UPDATE status
+                            SET "TIME" = %s, "STATUS" = %s
                             WHERE "STATUS_TYPE" = 'WORKER_OP_HEARTBEAT'
                             """
                             # Calculate time to next status check
@@ -276,11 +276,11 @@ def main():
                             heartbeat_status = f"Next worker status update in: {max(0, time_to_next_status):.2f} seconds"
                             cur.execute(heartbeat_query, (current_time, heartbeat_status))
                             heartbeat_conn.commit()
-                    
+
                     last_heartbeat_time = current_time
                 except Exception as e:
                     logging.error(f"Error updating worker operator heartbeat: {e}")
-            
+
             # Update worker status every minute
             if (current_time - last_status_update_time).total_seconds() >= 60:
                 try:
@@ -289,50 +289,50 @@ def main():
                             # Count successful and failed tasks in last 24 hours
                             status_query = """
                             WITH task_counts AS (
-                                SELECT 
+                                SELECT
                                     COUNT(*) FILTER (WHERE status = 'completed') as successful_tasks,
                                     COUNT(*) FILTER (WHERE status = 'ERROR') as failed_tasks
                                 FROM Tasks
                                 WHERE status_time >= %s
                             )
-                            UPDATE status 
-                            SET "TIME" = %s, 
-                                "STATUS" = %s 
+                            UPDATE status
+                            SET "TIME" = %s,
+                                "STATUS" = %s
                             WHERE "STATUS_TYPE" = 'WORKER_STATUS'
                             """
                             # 24 hours ago
                             twentyfour_hours_ago = current_time - timedelta(hours=24)
-                            
+
                             # Execute count query
                             cur.execute("""
-                                SELECT 
+                                SELECT
                                     COUNT(*) FILTER (WHERE status = 'COMPLETE') as successful_tasks,
                                     COUNT(*) FILTER (WHERE status = 'ERROR') as failed_tasks
                                 FROM Tasks
                                 WHERE status_time >= %s
                             """, (twentyfour_hours_ago,))
                             successful_tasks, failed_tasks = cur.fetchone()
-                            
+
                             # Prepare status message
                             status_message = (
                                 f"Tasks in last 24 hours - "
                                 f"Successful: {successful_tasks}, "
                                 f"Failed: {failed_tasks}"
                             )
-                            
+
                             # Update status
                             cur.execute(status_query, (
-                                twentyfour_hours_ago, 
-                                current_time, 
+                                twentyfour_hours_ago,
+                                current_time,
                                 status_message
                             ))
                             status_conn.commit()
-                    
+
                     last_status_update_time = current_time
                     logging.info(status_message)
                 except Exception as e:
                     logging.error(f"Error updating worker status: {e}")
-            
+
             # Existing worker pod monitoring logic
             monitor_worker_pods()  # Monitor running worker pods
             running_pods = get_running_pods_count()
@@ -341,14 +341,14 @@ def main():
             if running_pods < MAX_RUNNING_PODS:
                 # Get a ready task
                 task = get_and_mark_ready_task()
-                
+
                 if task:
                     taskid, iso, adm, filesize = task
                     create_worker_pod(iso, adm, filesize, taskid)
-            
+
             # Sleep to reduce CPU usage
             time.sleep(15)
-        
+
         except Exception as e:
             logging.error(f"Error in main loop: {e}")
             time.sleep(30)  # Wait before retrying to prevent rapid error loops

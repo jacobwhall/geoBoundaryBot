@@ -32,7 +32,7 @@ TASK_DIR = "/sciclone/geograd/geoBoundaries/database/geoBoundaries/sourceData/gb
 def connect_to_db(max_attempts=10, retry_delay=15):
     """
     Establishes a connection to the PostGIS database with retry mechanism.
-    
+
     Args:
         max_attempts (int): Maximum number of connection attempts
         retry_delay (int): Delay between connection attempts in seconds
@@ -50,7 +50,7 @@ def connect_to_db(max_attempts=10, retry_delay=15):
             return conn
         except Exception as e:
             logging.warning(f"Database connection attempt {attempt} failed: {e}")
-            
+
             if attempt < max_attempts:
                 logging.info(f"Retrying in {retry_delay} seconds...")
                 time.sleep(retry_delay)
@@ -125,24 +125,24 @@ def populate_tasks_table(conn):
 def get_last_queue_status_time(conn):
     """
     Retrieve the timestamp of the last QUEUE_STATUS update.
-    
+
     Args:
         conn (psycopg2.connection): Database connection
-    
+
     Returns:
         datetime: Timestamp of the last QUEUE_STATUS, or current time if not found
     """
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT "TIME" 
-                FROM status 
-                WHERE "STATUS_TYPE" = 'QUEUE_STATUS' 
-                ORDER BY "TIME" DESC 
+                SELECT "TIME"
+                FROM status
+                WHERE "STATUS_TYPE" = 'QUEUE_STATUS'
+                ORDER BY "TIME" DESC
                 LIMIT 1
             """)
             result = cur.fetchone()
-            
+
             if result:
                 return result[0]
             else:
@@ -155,26 +155,26 @@ def get_last_queue_status_time(conn):
 
 if __name__ == "__main__":
     logging.info("Script started.")
-    
+
     # Retrieve initial last queue time from database
     with connect_to_db() as initial_conn:
         last_queue_time = get_last_queue_status_time(initial_conn)
-    
+
     queue_interval = timedelta(hours=72)
-    
+
     while True:
         current_time = datetime.now()
-        
+
         # Calculate time until next queue population based on last queue time
         time_until_next_queue = queue_interval - (current_time - last_queue_time)
-        
+
         # Update queue heartbeat in database
         try:
             with connect_to_db() as heartbeat_conn:
                 with heartbeat_conn.cursor() as cur:
                     heartbeat_query = """
-                    UPDATE status 
-                    SET "TIME" = %s, "STATUS" = %s 
+                    UPDATE status
+                    SET "TIME" = %s, "STATUS" = %s
                     WHERE "STATUS_TYPE" = 'QUEUE_HEARTBEAT'
                     """
                     # Format time remaining, handling negative values
@@ -183,7 +183,7 @@ if __name__ == "__main__":
                     heartbeat_conn.commit()
         except Exception as e:
             logging.error(f"Error updating queue heartbeat: {e}")
-        
+
         # Check if it's time to populate queue
         if current_time - last_queue_time >= queue_interval:
             try:
@@ -191,15 +191,15 @@ if __name__ == "__main__":
                 with connect_to_db() as conn:
                     # Create tasks table if not exists
                     create_tasks_table(conn)
-                    
+
                     # Populate tasks and count (batch insert)
                     tasks_added = populate_tasks_table(conn)
-                    
+
                     # Update queue status in database
                     with conn.cursor() as cur:
                         status_query = """
-                        UPDATE status 
-                        SET "TIME" = %s, "STATUS" = %s 
+                        UPDATE status
+                        SET "TIME" = %s, "STATUS" = %s
                         WHERE "STATUS_TYPE" = 'QUEUE_STATUS'
                         """
                         status_message = f"Database population completed. Tasks added: {tasks_added}"
@@ -214,8 +214,8 @@ if __name__ == "__main__":
                     with connect_to_db() as conn:
                         with conn.cursor() as cur:
                             status_query = """
-                            UPDATE status 
-                            SET "TIME" = %s, "STATUS" = %s 
+                            UPDATE status
+                            SET "TIME" = %s, "STATUS" = %s
                             WHERE "STATUS_TYPE" = 'QUEUE_STATUS'
                             """
                             status_message = f"Queue population failed: {str(e)}"
@@ -223,6 +223,6 @@ if __name__ == "__main__":
                             conn.commit()
                 except Exception as db_error:
                     logging.error(f"Could not update status in database: {db_error}")
-        
+
         # Sleep to reduce CPU usage and provide consistent heartbeat
         time.sleep(1800)  # 1800-second heartbeat
