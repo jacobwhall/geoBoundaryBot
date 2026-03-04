@@ -134,6 +134,7 @@ name = "geoboundarybot"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "click" },
     { name = "geopandas" },
     { name = "pandas" },
     { name = "requests" },
@@ -148,6 +149,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "click", specifier = ">=8.3.1" },
     { name = "geopandas", specifier = ">=1.1.2" },
     { name = "pandas", specifier = ">=3.0.1" },
     { name = "requests", specifier = ">=2.32.5" },
