@@ -1,65 +1,41 @@
-FROM python:3.11-slim
+FROM debian:bookworm-slim
 
 ENV PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
-    GDAL_VERSION=3.6.2 \
     GDAL_DATA=/usr/share/gdal \
-    PROJ_LIB=/usr/share/proj
+    PROJ_LIB=/usr/share/proj \
+    UV_LINK_MODE=copy \
+    UV_COMPILE_BYTECODE=1
 
-# Install system dependencies in a single layer
+# System deps: geospatial libs, mapshaper, git-lfs
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    musl-dev \
-    gcc \
-    g++ \
-    libffi-dev \
-    libssl-dev \
-    make \
     git \
     git-lfs \
-    openssh-client \
     gdal-bin \
-    libgdal-dev \
-    libgeos-dev \
-    libproj-dev \
-    libjpeg-dev \
-    zlib1g-dev \
-    libcairo2-dev \
-    libpq-dev \
-    curl \
-    apt-transport-https \
-    ca-certificates \
-    gnupg \
-    lsb-release \
     nodejs \
     npm && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
+    apt-get clean && rm -rf /var/lib/apt/lists/* && \
+    npm install -g mapshaper && \
+    ln -sf /usr/local/bin/mapshaper /usr/local/bin/mapshaper-xl && \
+    git lfs install --system
 
-# Install Mapshaper-xl
-RUN npm install -g mapshaper && \
-    [ ! -f /usr/local/bin/mapshaper-xl ] && ln -s /usr/local/bin/mapshaper /usr/local/bin/mapshaper-xl || true
+# Install uv
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
+# Create non-root user
+RUN groupadd --gid 1000 gbbot && \
+    useradd --uid 1000 --gid 1000 --create-home gbbot
 
-# Install Docker CLI
-RUN curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg && \
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/debian $(lsb_release -cs) stable" > /etc/apt/sources.list.d/docker.list && \
-    apt-get update && apt-get install -y --no-install-recommends \
-    docker-ce-cli && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
+# Install Python + deps as non-root
+# uv reads requires-python from pyproject.toml to pick the Python version
+WORKDIR /app
+RUN chown gbbot:gbbot /app
+USER gbbot
 
-# Upgrade pip and install Python dependencies in a single layer
-RUN pip install --upgrade pip && \
-    pip install \
-    "numpy<2.0.0" \
-    geopandas==0.13.2 \
-    fiona==1.9.5 \
-    shapely \
-    rasterio \
-    pyproj \
-    kubernetes==31.0.0 \
-    jsonschema==4.19.0 \
-    zipfile36==0.1.3 \
-    psycopg2==2.9.10
+COPY --chown=gbbot:gbbot pyproject.toml uv.lock .python-version ./
+RUN uv python install && uv sync --locked --no-dev --group builder
 
-# Set up git-lfs and SSH
-RUN git lfs install --system && \
-    ssh-keygen -A  # Ensures SSH host keys are generated if needed
+# Remove .venv before copying app files so local .venv can't overwrite it
+# Then restore from the layer cache
+COPY --chown=gbbot:gbbot builder builder
+
+ENV PATH="/app/.venv/bin:$PATH"
