@@ -37,5 +37,6 @@ RUN uv python install && uv sync --locked --no-dev --group builder
 # Remove .venv before copying app files so local .venv can't overwrite it
 # Then restore from the layer cache
 COPY --chown=gbbot:gbbot builder builder
+COPY --chown=gbbot:gbbot dta dta
 
 ENV PATH="/app/.venv/bin:$PATH"

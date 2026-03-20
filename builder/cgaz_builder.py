@@ -2,7 +2,6 @@ import logging
 import os
 import sys
 import warnings
-import datetime
 import shutil
 import zipfile
 import traceback
@@ -12,149 +11,32 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import geopandas as gpd
 import pandas as pd
 
+from builder.paths import RELEASE_DATA, TMP_DIR, ISO_CSV, LSIB_GEOJSON
+
 # Ignore warnings about using '()' in str.contains
 warnings.filterwarnings("ignore", "This pattern has match groups")
 
-# Output and data paths (update to absolute if needed)
-outPath = os.path.abspath("/sciclone/geograd/geoBoundaries/tmp/CGAZ/") + "/"
-gBPath = (
-    os.path.abspath(
-        "/sciclone/geograd/geoBoundaries/database/geoBoundaries/releaseData/gbOpen/"
-    )
-    + "/"
-)
-CGAZOuptutPath = (
-    os.path.abspath(
-        "/sciclone/geograd/geoBoundaries/database/geoBoundaries/releaseData/CGAZ"
-    )
-    + "/"
-)
+# Derived paths
+outPath = str(TMP_DIR / "CGAZ") + "/"
+gBPath = str(RELEASE_DATA / "gbOpen") + "/"
+CGAZOutputPath = str(RELEASE_DATA / "CGAZ") + "/"
+stdGeom = str(LSIB_GEOJSON)
+stdISO = str(ISO_CSV)
 
-stdGeom = os.path.abspath(
-    "/sciclone/geograd/geoBoundaries/geoBoundaryBot/dta/usDoSLSIB_Mar2020.geojson"
-)
-stdISO = os.path.abspath(
-    "/sciclone/geograd/geoBoundaries/geoBoundaryBot/dta/iso_3166_1_alpha_3.csv"
-)
-
-
-# Simple direct file-based logging
-class DirectLogger:
-    def __init__(self):
-        self.log_dir = "/sciclone/geograd/geoBoundaries/logs/cgaz"
-        os.makedirs(self.log_dir, exist_ok=True)
-        self.log_file = os.path.join(
-            self.log_dir,
-            f"cgaz_builder_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log",
-        )
-
-        # Log initial information
-        self._write_log("=" * 80)
-        self._write_log(f"Starting CGAZ Builder - {datetime.datetime.now()}")
-        self._write_log(f"Log file: {self.log_file}")
-        self._write_log(f"Output directory: {outPath}")
-        self._write_log("=" * 80)
-
-    def _write_log(self, message, level="INFO"):
-        """Write directly to log file and print to console"""
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        log_line = f"{timestamp} - {message}\n"
-
-        # Write to file
-        try:
-            with open(self.log_file, "a") as f:
-                f.write(log_line)
-        except Exception as e:
-            print(f"ERROR: Failed to write to log file: {e}")
-
-        # Always print to console
-        print(log_line.strip())
-
-    def debug(self, message):
-        self._write_log(f"DEBUG: {message}")
-
-    def info(self, message):
-        self._write_log(f"INFO: {message}")
-
-    def warning(self, message):
-        self._write_log(f"WARNING: {message}")
-
-    def error(self, message):
-        self._write_log(f"ERROR: {message}")
-
-    def critical(self, message):
-        self._write_log(f"CRITICAL: {message}")
-        sys.exit(1)
-
-    # Dummy method for compatibility with set_verbosity
-    def setLevel(self, level):
-        pass
-
-
-# Initialize direct logger
-logger = DirectLogger()
-logger.info("Starting geometry processing...")
+logger = logging.getLogger(__name__)
 
 
 def cmd(command, **kwargs):
-    """Run a shell command with enhanced logging."""
-    logger.debug(f"Executing command: {command}")
-
-    # Log environment information
-    logger.debug(f"Current working directory: {os.getcwd()}")
-
-    # Check for file operations in the command
-    file_ops = [">", ">>", "<", "|", "cp", "mv", "rm", "ogr2ogr", "mapshaper"]
-    if any(op in command for op in file_ops):
-        # Log file operations
-        logger.debug("File operation detected in command")
-
-        # Check for input/output files in command
-        for arg in command.split():
-            if any(ext in arg for ext in [".geojson", ".topojson", ".shp", ".gpkg"]):
-                abs_path = os.path.abspath(arg)
-                logger.debug(f"File path in command: {arg}")
-                logger.debug(f"Absolute path: {abs_path}")
-                logger.debug(f"File exists: {os.path.exists(abs_path)}")
-                if os.path.isfile(abs_path):
-                    logger.debug(f"File size: {os.path.getsize(abs_path)} bytes")
-
-    # Execute the command
-    logger.debug(f"Executing command: {command}")
+    """Run a shell command with logging."""
+    logger.debug("Executing: %s", command)
     r = run(
         command, stdout=PIPE, stderr=PIPE, universal_newlines=True, shell=True, **kwargs
     )
-
-    # Log command results
     if r.returncode != 0:
-        logger.error(f"Command failed with return code {r.returncode}")
-        logger.error(f"Command: {command}")
-        logger.error(f"Working directory: {os.getcwd()}")
-
+        logger.error("Command failed (rc=%d): %s", r.returncode, command)
         if r.stderr.strip():
-            logger.error(f"Command stderr: {r.stderr.strip()}")
-
-            # Additional debug for common errors
-            if "No such file or directory" in r.stderr:
-                logger.error(
-                    "File not found error detected. Check if all required files exist."
-                )
-            elif "Unable to open datasource" in r.stderr:
-                logger.error(
-                    "Unable to open datasource. Check file paths and permissions."
-                )
-
-    # Log command output if verbose
-    if r.stdout.strip():
-        logger.debug(f"Command stdout: {r.stdout.strip()}")
-
+            logger.error("stderr: %s", r.stderr.strip())
     return r
-
-
-def set_verbosity(verbose_level=0):
-    """Dummy function - we log everything now."""
-    logger.info("Verbosity setting ignored - logging all messages")
-    logger.info("Starting data preprocessing...")
 
 
 def preprocess_dta():
@@ -277,8 +159,9 @@ def preprocess_dta():
     disputedG["ISO_CODE"] = disputedG.COUNTRY_NA.map(isoLookup)
     disputedG[disputedG.ISO_CODE.isna() | disputedG.ISO_CODE == ""].ISO_CODE = "None"
 
-    G.to_file("./baseISO.geojson", driver="GeoJSON")
-    disputedG.to_file("./disputedISO.geojson", driver="GeoJSON")
+    os.makedirs(outPath, exist_ok=True)
+    G.to_file(os.path.join(outPath, "baseISO.geojson"), driver="GeoJSON")
+    disputedG.to_file(os.path.join(outPath, "disputedISO.geojson"), driver="GeoJSON")
 
 
 def process_geometry_wrapper(args, adm0):
@@ -454,9 +337,7 @@ def load_iso_name_lookup():
     """Load ISO code to country name mapping from CSV."""
     iso_lookup = {}
     try:
-        iso_df = pd.read_csv(
-            os.path.join(os.path.dirname(__file__), "../../dta/iso_3166_1_alpha_3.csv")
-        )
+        iso_df = pd.read_csv(str(ISO_CSV))
         iso_lookup = dict(zip(iso_df["Alpha-3code"], iso_df["Name"]))
         logger.debug(f"Loaded ISO name lookup with {len(iso_lookup)} entries")
     except Exception as e:
@@ -464,8 +345,16 @@ def load_iso_name_lookup():
     return iso_lookup
 
 
-# Cache the ISO lookup
-_ISO_NAME_LOOKUP = load_iso_name_lookup()
+# Lazy-loaded cache — avoids file I/O at import time
+_ISO_NAME_LOOKUP = None
+
+
+def get_iso_name_lookup():
+    """Return the cached ISO name lookup, loading on first call."""
+    global _ISO_NAME_LOOKUP
+    if _ISO_NAME_LOOKUP is None:
+        _ISO_NAME_LOOKUP = load_iso_name_lookup()
+    return _ISO_NAME_LOOKUP
 
 
 def filter_attributes(gdf, adm_level):
@@ -489,7 +378,7 @@ def filter_attributes(gdf, adm_level):
     if "shapeName" not in result.columns:
         if adm_level == "ADM0":
             # For ADM0, use the ISO name lookup
-            result["shapeName"] = result["shapeID"].map(_ISO_NAME_LOOKUP).fillna("")
+            result["shapeName"] = result["shapeID"].map(get_iso_name_lookup()).fillna("")
             # Fallback to original name if lookup fails
             if result["shapeName"].empty or result["shapeName"].isna().all():
                 result["shapeName"] = result.get("NAME_0", result.get("NAME", ""))
@@ -644,11 +533,13 @@ def join_admins(adm0str, adm1str, adm2str):
 
 
 def dissolve_based_on_ISO_Code():
+    base_in = os.path.join(outPath, "baseISO.geojson")
+    disp_in = os.path.join(outPath, "disputedISO.geojson")
     cmd(
-        f"mapshaper-xl ./baseISO.geojson -dissolve fields='ISO_CODE' multipart -o force format=geojson {outPath}baseISO.geojson"
+        f"mapshaper-xl {base_in} -dissolve fields='ISO_CODE' multipart -o force format=geojson {base_in}"
     )
     cmd(
-        f"mapshaper-xl ./disputedISO.geojson -dissolve fields='ISO_CODE' multipart -o format=geojson {outPath}disputedISO.geojson"
+        f"mapshaper-xl {disp_in} -dissolve fields='ISO_CODE' multipart -o format=geojson {disp_in}"
     )
 
 
@@ -658,7 +549,7 @@ def package_final_outputs():
         logger.info("Starting to package final outputs...")
 
         # Ensure output directory exists
-        os.makedirs(CGAZOuptutPath, exist_ok=True)
+        os.makedirs(CGAZOutputPath, exist_ok=True)
 
         for adm_level in ["ADM0", "ADM1", "ADM2"]:
             # Base filenames
@@ -667,14 +558,14 @@ def package_final_outputs():
 
             # 1. Copy GeoJSON
             src_geojson = f"{src_base}.geojson"
-            dst_geojson = os.path.join(CGAZOuptutPath, f"{base_filename}.geojson")
+            dst_geojson = os.path.join(CGAZOutputPath, f"{base_filename}.geojson")
             if os.path.exists(src_geojson):
                 shutil.copy2(src_geojson, dst_geojson)
                 logger.info(f"Copied {src_geojson} to {dst_geojson}")
 
             # 2. Copy GeoPackage
             src_gpkg = f"{src_base}.gpkg"
-            dst_gpkg = os.path.join(CGAZOuptutPath, f"{base_filename}.gpkg")
+            dst_gpkg = os.path.join(CGAZOutputPath, f"{base_filename}.gpkg")
             if os.path.exists(src_gpkg):
                 shutil.copy2(src_gpkg, dst_gpkg)
                 logger.info(f"Copied {src_gpkg} to {dst_gpkg}")
@@ -684,7 +575,7 @@ def package_final_outputs():
                 f"{src_base}.{ext}" for ext in ["shp", "shx", "dbf", "prj"]
             ]
             if all(os.path.exists(f) for f in shapefile_components):
-                zip_path = os.path.join(CGAZOuptutPath, base_filename)
+                zip_path = os.path.join(CGAZOutputPath, base_filename)
                 with zipfile.ZipFile(
                     f"{zip_path}.zip", "w", zipfile.ZIP_DEFLATED
                 ) as zipf:
@@ -708,8 +599,10 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
+    level = logging.WARNING if args.verbose == 0 else (logging.INFO if args.verbose == 1 else logging.DEBUG)
+    logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
     try:
-        set_verbosity(args.verbose)
         logger.info("Starting CGAZ boundary processing...")
         preprocess_dta()
         adm0str, adm1str, adm2str = process_geometries(args)

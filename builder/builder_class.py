@@ -1,74 +1,38 @@
-import zipfile
-import hashlib
-import os
-
-os.environ["OGR_GEOJSON_MAX_OBJ_SIZE"] = "0"
-import shutil
-import geopandas as gpd
 import datetime
-from shapely.validation import explain_validity
-from shapely.geometry import shape
-from shapely.geometry.polygon import Polygon
-from shapely.geometry.multipolygon import MultiPolygon
-import time
-import subprocess
+import hashlib
 import json
-import matplotlib.pyplot as plt
-import shutil
-import pandas as pd
 import logging
+import os
+import shutil
+import subprocess
+import time
+import zipfile
+
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import pandas as pd
+from shapely.geometry import shape
+from shapely.geometry.multipolygon import MultiPolygon
+from shapely.geometry.polygon import Polygon
+from shapely.validation import explain_validity
+
+from builder.paths import SOURCE_DATA, RELEASE_DATA, TMP_DIR
 
 
 class builder:
-    def __init__(
-        self, ISO, ADM, product, basePath, logPath, tmpPath, validISO, validLicense
-    ):
-        # Configure logging
-        self.logger = logging.getLogger(f"{__name__}.{ISO}_{ADM}_{product}")
-        self.logger.setLevel(logging.INFO)
+    def __init__(self, ISO, ADM, product, validISO, validLicense):
+        os.environ.setdefault("OGR_GEOJSON_MAX_OBJ_SIZE", "0")
 
-        # Use the same log file as worker_script
-        log_file = os.path.join(
-            logPath,
-            f"worker_script_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log",
-        )
-
-        # If no handlers exist, add file and stream handlers
-        if not self.logger.handlers:
-            file_handler = logging.FileHandler(log_file)
-            file_handler.setFormatter(
-                logging.Formatter(
-                    "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-                )
-            )
-            self.logger.addHandler(file_handler)
-
-            # Optional: add stream handler if not already added in worker_script
-            stream_handler = logging.StreamHandler()
-            stream_handler.setFormatter(
-                logging.Formatter(
-                    "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-                )
-            )
-            self.logger.addHandler(stream_handler)
+        self.logger = logging.getLogger(f"builder.{product}.{ISO}_{ADM}")
 
         # Basic attributes
         self.ISO = ISO
         self.ADM = ADM
         self.product = product
-        self.basePath = basePath
-        self.logPath = logPath
-        self.tmpPath = tmpPath
-        self.sourceFolder = os.path.join(self.basePath, "sourceData", self.product)
-        self.sourcePath = os.path.join(
-            self.basePath, "sourceData", self.product, f"{self.ISO}_{self.ADM}.zip"
-        )
-        self.targetPath = os.path.join(
-            self.basePath, "releaseData", self.product, self.ISO, self.ADM
-        )
-        self.zipExtractPath = os.path.join(
-            self.tmpPath, self.product, f"{self.ISO}_{self.ADM}"
-        )
+        self.sourceFolder = SOURCE_DATA / product
+        self.sourcePath = SOURCE_DATA / product / f"{ISO}_{ADM}.zip"
+        self.targetPath = RELEASE_DATA / product / ISO / ADM
+        self.zipExtractPath = TMP_DIR / product / f"{ISO}_{ADM}"
         self.validISO = validISO
         self.validLicense = [x.lower().strip() for x in validLicense]
 
@@ -180,17 +144,7 @@ class builder:
     def hashCalc(self):
         m = hashlib.sha256()
         chunkSize = 8192
-        with open(
-            self.basePath
-            + "sourceData/"
-            + self.product
-            + "/"
-            + self.ISO
-            + "_"
-            + self.ADM
-            + ".zip",
-            "rb",
-        ) as zF:
+        with open(self.sourcePath, "rb") as zF:
             while True:
                 chunk = zF.read(chunkSize)
                 if len(chunk):
@@ -208,7 +162,7 @@ class builder:
             return "INFO: Source file does not exist for this boundary."
 
         self.unzip()
-        if self.unzip == 1:
+        if self.dataExtractFail == 1:
             return "ERROR: The zipfile in the source directory failed to extract correctly."
 
         self.metaLoad()
@@ -505,13 +459,13 @@ class builder:
             self.metaDataLib["boundarySourceURL"] = self.metaReq["dataSource"]
 
             try:
-                gitLookup = str(
-                    "cd "
-                    + str(self.sourceFolder)
-                    + "; git log -1 --format=%cd -p -- "
-                    + self.sourcePath
+                result = subprocess.run(
+                    ["git", "log", "-1", "--format=%cd", "-p", "--",
+                     str(self.sourcePath)],
+                    cwd=str(self.sourceFolder),
+                    capture_output=True, text=True, timeout=30,
                 )
-                sourceDataDate = os.popen(gitLookup).read()
+                sourceDataDate = result.stdout.strip()
                 self.metaDataLib["sourceDataUpdateDate"] = (
                     sourceDataDate.split("-")[0]
                     .strip()
@@ -521,13 +475,10 @@ class builder:
                 if len(self.metaDataLib["sourceDataUpdateDate"]) < 2:
                     self.logger.critical(
                         "GIT LOCAL API - Source Data Update Date: "
-                        + str(gitLookup)
-                        + " | "
                         + str(sourceDataDate)
                     )
                     return (
-                        "ERROR: The source data date was unable to be calculated during build (blank result).  See log."
-                        + str(gitLookup)
+                        "ERROR: The source data date was unable to be calculated during build (blank result)."
                     )
                 else:
                     self.logger.info(
@@ -535,7 +486,7 @@ class builder:
                         + str(self.metaDataLib["sourceDataUpdateDate"])
                     )
 
-            except subprocess.CalledProcessError as e:
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
                 self.logger.critical(
                     "GIT LOCAL API - Source Data Update Date Subprocess Response: "
                     + str(e)
@@ -1036,23 +987,10 @@ class builder:
         self.logger.info("Entering main routine to check for updates.")
         try:
             self.logger.info("Checking if geometry size has changed.")
-            tmpFold = self.tmpPath + self.ISO + self.ADM + self.product + "/"
-            newJSON = (
-                tmpFold
-                + "geoBoundaries-"
-                + str(self.ISO)
-                + "-"
-                + str(self.ADM)
-                + ".geojson"
-            )
-            oldJSON = (
-                self.targetPath
-                + "/geoBoundaries-"
-                + str(self.ISO)
-                + "-"
-                + str(self.ADM)
-                + ".geojson"
-            )
+            base_name = f"geoBoundaries-{self.ISO}-{self.ADM}"
+            tmpFold = TMP_DIR / f"{self.ISO}{self.ADM}{self.product}"
+            newJSON = tmpFold / f"{base_name}.geojson"
+            oldJSON = self.targetPath / f"{base_name}.geojson"
 
             newSize = os.path.getsize(newJSON)
             oldSize = os.path.getsize(oldJSON)
@@ -1071,14 +1009,7 @@ class builder:
             # We can't simply do a binary contrast here, as the new meta.txt will have new timestamps,
             # so this requires we only load part of each file.
             newCSVpath = metaTXT
-            oldCSVpath = (
-                self.targetPath
-                + "/geoBoundaries-"
-                + str(self.ISO)
-                + "-"
-                + str(self.ADM)
-                + "-metaData.txt"
-            )
+            oldCSVpath = self.targetPath / f"{base_name}-metaData.txt"
 
             with open(newCSVpath, "r") as f:
                 newMetaChunk = f.readlines()[:19]
@@ -1131,33 +1062,27 @@ class builder:
         # If changes were detected, clean up the target directory first
         if self.changesDetected:
             self.cleanup_target_directory()
-        tmpJson = os.path.join(
-            self.tmpPath, f"{self.ISO}{self.ADM}{self.product}.geoJSON"
-        )
-        tmpFold = os.path.join(self.tmpPath, f"{self.ISO}{self.ADM}{self.product}/")
-
         base_name = f"geoBoundaries-{self.ISO}-{self.ADM}"
+        tmpFold = TMP_DIR / f"{self.ISO}{self.ADM}{self.product}"
+        tmpJson = TMP_DIR / f"{self.ISO}{self.ADM}{self.product}.geoJSON"
 
         # Simplified versions
-        jsonOUT_simp = os.path.join(tmpFold, f"{base_name}_simplified.geojson")
-        topoOUT_simp = os.path.join(tmpFold, f"{base_name}_simplified.topojson")
-        shpOUT_simp = os.path.join(tmpFold, f"{base_name}_simplified.zip")
+        jsonOUT_simp = tmpFold / f"{base_name}_simplified.geojson"
+        topoOUT_simp = tmpFold / f"{base_name}_simplified.topojson"
+        shpOUT_simp = tmpFold / f"{base_name}_simplified.zip"
 
         # Full versions
-        jsonOUT = os.path.join(tmpFold, f"{base_name}.geojson")
-        topoOUT = os.path.join(tmpFold, f"{base_name}.topojson")
-        shpOUT = os.path.join(tmpFold, f"{base_name}.zip")
-        imgOUT = os.path.join(tmpFold, f"{base_name}-PREVIEW.png")
-        fullZip = os.path.join(tmpFold, f"{base_name}-all.zip")
-        metaJSON = os.path.join(tmpFold, f"{base_name}-metaData.json")
-        metaTXT = os.path.join(tmpFold, f"{base_name}-metaData.txt")
-        citeUse = os.path.join(tmpFold, "CITATION-AND-USE-geoBoundaries.txt")
+        jsonOUT = tmpFold / f"{base_name}.geojson"
+        topoOUT = tmpFold / f"{base_name}.topojson"
+        shpOUT = tmpFold / f"{base_name}.zip"
+        imgOUT = tmpFold / f"{base_name}-PREVIEW.png"
+        fullZip = tmpFold / f"{base_name}-all.zip"
+        metaJSON = tmpFold / f"{base_name}-metaData.json"
+        metaTXT = tmpFold / f"{base_name}-metaData.txt"
+        citeUse = tmpFold / "CITATION-AND-USE-geoBoundaries.txt"
 
-        if not os.path.exists(tmpFold):
-            os.makedirs(tmpFold)
-
-        if not os.path.exists(self.targetPath):
-            os.makedirs(self.targetPath)
+        tmpFold.mkdir(parents=True, exist_ok=True)
+        self.targetPath.mkdir(parents=True, exist_ok=True)
 
         # Write the metadata file out
         self.logger.info("Writing metadata files.")
@@ -1271,34 +1196,19 @@ class builder:
             self.logger.info("Intermediary GeoJSON export succeeded after coercion.")
 
         writeRet = []
-        self.logger.info("Debug - File paths:")
-        self.logger.info(f"Working directory: {os.getcwd()}")
-        self.logger.info(f"Input file (tmpJson): {tmpJson}")
-        self.logger.info(f"Input file exists: {os.path.exists(tmpJson)}")
-        self.logger.info(f"Output folder (tmpFold): {tmpFold}")
-        self.logger.info(f"Output folder exists: {os.path.exists(tmpFold)}")
-        self.logger.info("Mapshaper Call")
-        write = (
-            "mapshaper-xl 6gb "
-            + tmpJson
-            + " -clean gap-fill-area=500m2 snap-interval=.00001"
-            + " -o format=shapefile "
-            + shpOUT
-            + " -o format=topojson "
-            + topoOUT
-            + " -o format=geojson "
-            + jsonOUT
-        )
-
-        # Run mapshaper and check return code
-        ret_code = subprocess.Popen(write, shell=True).wait()
-
-        # If mapshaper-xl failed, try regular mapshaper
-        if ret_code == 127:
-            self.logger.info("mapshaper-xl not found, trying mapshaper instead...")
-            write = write.replace("mapshaper-xl", "mapshaper")
-            self.logger.info(f"Retrying with command: {write}")
-            ret_code = subprocess.Popen(write, shell=True).wait()
+        self.logger.info("Running mapshaper (full resolution)")
+        mapshaper_full = [
+            "mapshaper-xl", "6gb", str(tmpJson),
+            "-clean", "gap-fill-area=500m2", "snap-interval=.00001",
+            "-o", f"format=shapefile", str(shpOUT),
+            "-o", f"format=topojson", str(topoOUT),
+            "-o", f"format=geojson", str(jsonOUT),
+        ]
+        result = subprocess.run(mapshaper_full, capture_output=True, text=True,
+                                timeout=600)
+        ret_code = result.returncode
+        if ret_code != 0:
+            self.logger.error("mapshaper stderr: %s", result.stderr)
         writeRet.append(ret_code)
         self.logger.info(f"Mapshaper Call Done with return code: {ret_code}")
 
@@ -1339,21 +1249,20 @@ class builder:
 
         self.logger.info("Starting simplified build")
 
-        self.logger.info("Building shapefiles, geojson, topojson (Simplified).")
-        writeSimplify = (
-            "/usr/local/bin/mapshaper-xl 6gb "
-            + tmpJson
-            + " -simplify dp interval=100 keep-shapes"
-            + " -clean gap-fill-area=500m2 snap-interval=.00001"
-            + " -o format=shapefile "
-            + shpOUT_simp
-            + " -o format=topojson "
-            + topoOUT_simp
-            + " -o format=geojson "
-            + jsonOUT_simp
-        )
-
-        writeRet.append(subprocess.Popen(writeSimplify, shell=True).wait())
+        self.logger.info("Running mapshaper (simplified)")
+        mapshaper_simp = [
+            "mapshaper-xl", "6gb", str(tmpJson),
+            "-simplify", "dp", "interval=100", "keep-shapes",
+            "-clean", "gap-fill-area=500m2", "snap-interval=.00001",
+            "-o", f"format=shapefile", str(shpOUT_simp),
+            "-o", f"format=topojson", str(topoOUT_simp),
+            "-o", f"format=geojson", str(jsonOUT_simp),
+        ]
+        result_simp = subprocess.run(mapshaper_simp, capture_output=True, text=True,
+                                     timeout=600)
+        if result_simp.returncode != 0:
+            self.logger.error("mapshaper (simplified) stderr: %s", result_simp.stderr)
+        writeRet.append(result_simp.returncode)
 
         # Need to open and define the projection - unsure if this is a bug in mapshaper precluding
         # the projection outputs, or if our tests were ill-formed.
@@ -1396,6 +1305,7 @@ class builder:
                 + str(self.metaReq["source"])
             )
         plt.savefig(imgOUT)
+        plt.close("all")
 
         # Check if there has been any update to the file.
         # If not, allow for build to proceed to confirm input file validity, but don't write outputs.
@@ -1405,35 +1315,15 @@ class builder:
 
         if self.changesDetected == True:
             self.logger.info("Building zip files.")
-            shutil.make_archive(
-                self.tmpPath
-                + "zipInterim/"
-                + self.product
-                + "/geoBoundaries-"
-                + self.ISO
-                + "-"
-                + self.ADM
-                + "-all",
-                "zip",
-                tmpFold,
-            )
-            shutil.move(
-                self.tmpPath
-                + "zipInterim/"
-                + self.product
-                + "/geoBoundaries-"
-                + self.ISO
-                + "-"
-                + self.ADM
-                + "-all.zip",
-                fullZip,
-            )
+            zip_interim = TMP_DIR / "zipInterim" / self.product
+            zip_interim.mkdir(parents=True, exist_ok=True)
+            zip_base = zip_interim / f"{base_name}-all"
+            shutil.make_archive(str(zip_base), "zip", str(tmpFold))
+            shutil.move(str(zip_base.with_suffix(".zip")), str(fullZip))
+
             self.logger.info("Copying outputs into release folder.")
-            srcFiles = os.listdir(tmpFold)
-            for f in srcFiles:
-                sourcePath = os.path.join(tmpFold, f)
-                destPath = os.path.join(self.targetPath, f)
-                shutil.copy(sourcePath, destPath)
+            for f in tmpFold.iterdir():
+                shutil.copy(str(f), str(self.targetPath / f.name))
 
             self.logger.info("Files copied, cleaning up.")
 

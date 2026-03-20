@@ -1,0 +1,102 @@
+image:
+  repository: ghcr.io/wmgeolab/geoboundarybot
+  tag: latest
+  pullPolicy: Always
+
+# Nightly build CronJob
+build:
+  schedule: "0 2 * * *"
+  sync:
+    dataRepo: https://github.com/wmgeolab/geoBoundaries.git
+    branch: main
+    lfs: true
+  dask:
+    workers: 4 # scale target during builds (scaled to 0 when idle)
+  resources:
+    requests:
+      memory: 2Gi
+      cpu: "1"
+    limits:
+      memory: 4Gi
+      cpu: "2"
+
+# Persistent volume for the geoBoundaries data repo
+volume:
+  storageClass: ""
+  size: 100Gi
+  accessModes:
+    - ReadWriteMany
+
+# Dask subchart configuration
+# https://github.com/dask/helm-chart
+dask:
+  scheduler:
+    image:
+      repository: ghcr.io/wmgeolab/geoboundarybot
+      tag: latest
+    serviceType: ClusterIP
+
+  worker:
+    replicas: 0 # run.py scales workers up/down during builds
+    image:
+      repository: ghcr.io/wmgeolab/geoboundarybot
+      tag: latest
+    env:
+      - name: GB_REPO_DIR
+        value: /data/geoBoundaries
+    resources:
+      requests:
+        memory: 4Gi
+        cpu: "2"
+      limits:
+        memory: 8Gi
+        cpu: "4"
+    mounts:
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: gb-data
+      volumeMounts:
+        - name: data
+          mountPath: /data/geoBoundaries
+          readOnly: true
+
+  jupyter:
+    enabled: false
+
+# S3-compatible storage for build outputs (e.g. Cloudflare R2)
+# Disabled by default. Create the credentials secret before enabling:
+#   kubectl create secret generic gb-s3-credentials \
+#     --from-literal=access-key-id=<key> \
+#     --from-literal=secret-access-key=<secret>
+s3:
+  enabled: false
+  endpoint: ""        # e.g. https://<account>.r2.cloudflarestorage.com
+  bucket: ""
+  keyPrefix: ""       # optional prefix prepended to all keys
+  credentialsSecret: gb-s3-credentials
+
+# Ephemeral PostGIS for passing build outputs to the CGAZ job
+builddb:
+  image:
+    repository: postgis/postgis
+    tag: "17-3.5"
+  storageClass: ""
+  size: 50Gi
+
+# Cloudflare Tunnel
+# Create the token secret before install:
+#   kubectl create secret generic cloudflared-token --from-literal=token=<your-token>
+cloudflared:
+  replicas: 2
+  image:
+    repository: cloudflare/cloudflared
+    tag: "2026.2.0"
+  tokenSecret: cloudflared-token
+  resources:
+    requests:
+      memory: 256Mi
+      cpu: 100m
+    limits:
+      memory: 512Mi
+      cpu: 500m

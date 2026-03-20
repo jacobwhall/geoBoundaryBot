@@ -1,0 +1,77 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ .Release.Name }}-build
+  labels:
+    app.kubernetes.io/name: {{ .Chart.Name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  schedule: {{ .Values.build.schedule | quote }}
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      ttlSecondsAfterFinished: 86400
+      template:
+        spec:
+          serviceAccountName: {{ .Release.Name }}-build
+          restartPolicy: Never
+          containers:
+            - name: build-driver
+              image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              command: ["python", "-m", "builder.run"]
+              env:
+                - name: GB_REPO_DIR
+                  value: /data/geoBoundaries
+                - name: GB_DATA_REPO
+                  value: {{ .Values.build.sync.dataRepo }}
+                - name: GB_DATA_BRANCH
+                  value: {{ .Values.build.sync.branch }}
+                - name: GB_DATA_LFS
+                  value: {{ .Values.build.sync.lfs | quote }}
+                - name: GB_RELEASE_NAME
+                  value: {{ .Release.Name }}
+                - name: GB_NAMESPACE
+                  value: {{ .Release.Namespace }}
+                - name: GB_IMAGE
+                  value: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+                - name: DASK_SCHEDULER
+                  value: "tcp://{{ .Release.Name }}-dask-scheduler:8786"
+                - name: DASK_WORKERS
+                  value: {{ .Values.build.dask.workers | quote }}
+                - name: GB_POSTGIS_IMAGE
+                  value: "{{ .Values.builddb.image.repository }}:{{ .Values.builddb.image.tag }}"
+                - name: GB_BUILDDB_STORAGE_CLASS
+                  value: {{ .Values.builddb.storageClass | quote }}
+                - name: GB_BUILDDB_STORAGE_SIZE
+                  value: {{ .Values.builddb.size | quote }}
+                {{- if .Values.s3.enabled }}
+                - name: S3_ENDPOINT_URL
+                  value: {{ .Values.s3.endpoint | quote }}
+                - name: S3_BUCKET
+                  value: {{ .Values.s3.bucket | quote }}
+                - name: S3_KEY_PREFIX
+                  value: {{ .Values.s3.keyPrefix | quote }}
+                - name: AWS_ACCESS_KEY_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.s3.credentialsSecret }}
+                      key: access-key-id
+                - name: AWS_SECRET_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.s3.credentialsSecret }}
+                      key: secret-access-key
+                {{- end }}
+              volumeMounts:
+                - name: data
+                  mountPath: /data/geoBoundaries
+              {{- with .Values.build.resources }}
+              resources:
+                {{- toYaml . | nindent 16 }}
+              {{- end }}
+          volumes:
+            - name: data
+              persistentVolumeClaim:
+                claimName: {{ .Release.Name }}-data
