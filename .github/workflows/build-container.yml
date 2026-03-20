@@ -5,8 +5,8 @@ on:
       - main
 
 env:
-  IMAGE_NAME: geoboundarybot
-  IMAGE_REGISTRY: ghcr.io/wmgeolab
+  IMAGE_NAME: ${{ github.event.repository.name }}
+  IMAGE_REGISTRY: ghcr.io/${{ github.repository_owner }}
   REGISTRY_USER: ${{ github.actor }}
   REGISTRY_PASSWORD: ${{ github.token }}
 
