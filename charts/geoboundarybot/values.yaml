@@ -23,7 +23,7 @@ build:
 # Persistent volume for the geoBoundaries data repo
 volume:
   storageClass: ""
-  size: 100Gi
+  size: 250Gi
   accessModes:
     - ReadWriteMany
 
@@ -49,7 +49,7 @@ dask:
         memory: 4Gi
         cpu: "2"
       limits:
-        memory: 8Gi
+        memory: 20Gi
         cpu: "4"
     mounts:
       volumes:
@@ -71,9 +71,9 @@ dask:
 #     --from-literal=secret-access-key=<secret>
 s3:
   enabled: false
-  endpoint: ""        # e.g. https://<account>.r2.cloudflarestorage.com
+  endpoint: "" # e.g. https://<account>.r2.cloudflarestorage.com
   bucket: ""
-  keyPrefix: ""       # optional prefix prepended to all keys
+  keyPrefix: "" # optional prefix prepended to all keys
   credentialsSecret: gb-s3-credentials
 
 # Ephemeral PostGIS for passing build outputs to the CGAZ job
@@ -82,7 +82,7 @@ builddb:
     repository: postgis/postgis
     tag: "17-3.5"
   storageClass: ""
-  size: 50Gi
+  size: 250Gi
 
 # Cloudflare Tunnel
 # Create the token secret before install:

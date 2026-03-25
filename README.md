@@ -2,28 +2,6 @@
 
 Confirming geoBoundaries submissions are in the proper format. And destroying all humans on the weekend.
 
-## Local development
-
-Install Git LFS and mapshaper:
-
-```sh
-git lfs install --system --skip-repo
-npm install -g mapshaper
-```
-
-Install Python dependencies with [uv](https://docs.astral.sh/uv/):
-
-```sh
-uv sync --group builder --group dev
-```
-
-Clone the geoBoundaries data repo:
-
-```sh
-git clone --depth=1 https://github.com/wmgeolab/geoBoundaries ../geoBoundaries/
-cd ../geoBoundaries/ && git lfs pull
-```
-
 ## Deploying with Helm
 
 The Helm chart lives in `charts/geoboundarybot/`. It deploys:
