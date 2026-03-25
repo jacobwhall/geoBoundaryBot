@@ -17,7 +17,7 @@ dependencies = [
 
 [dependency-groups]
 builder = [
-    "dask>=2026.1.2",
+    "dask[distributed]>=2026.1.2",
     "fiona>=1.10.1",
     "geoalchemy2>=0.17.1",
     "jsonschema>=4.26.0",
