@@ -119,6 +119,11 @@ def create_build_db(timeout=120):
             "template": {
                 "metadata": {"labels": labels},
                 "spec": {
+                    "securityContext": {
+                        "runAsUser": 999,
+                        "runAsGroup": 999,
+                        "fsGroup": 999,
+                    },
                     "containers": [{
                         "name": "postgis",
                         "image": image,
