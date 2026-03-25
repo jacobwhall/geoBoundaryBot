@@ -169,6 +169,15 @@ def create_build_db(timeout=120):
 
     log.info("Creating build database: %s (%s on %s)", name, storage_size,
              storage_class or "default storage class")
+
+    # Clean up leftover resources from any previous run
+    for obj in (deploy, svc, pvc):
+        try:
+            obj.delete()
+            log.info("Deleted existing %s/%s", obj.kind, obj.name)
+        except Exception:
+            pass
+
     pvc.create()
     deploy.create()
     svc.create()
@@ -188,7 +197,18 @@ def create_build_db(timeout=120):
         )
 
     db_url = f"postgresql://gb:builddb@{name}:5432/geoboundaries"
-    _init_build_db_schema(db_url)
+
+    # Service endpoints may lag behind readyReplicas; retry initial connection
+    for attempt in range(6):
+        try:
+            _init_build_db_schema(db_url)
+            break
+        except Exception:
+            if attempt == 5:
+                raise
+            log.info("DB not accepting connections yet, retrying in 5s…")
+            time.sleep(5)
+
     return db_url
 
 
