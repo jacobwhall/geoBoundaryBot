@@ -48,7 +48,8 @@ def sync_repo(path, remote, branch="main", lfs=False):
         )
 
     if lfs:
-        subprocess.run([*git, "lfs", "pull"], check=True)
+        subprocess.run(["git", "lfs", "install"], cwd=path, check=True)
+        subprocess.run(["git", "lfs", "pull"], cwd=path, check=True)
 
 
 def sync_data_repo():
