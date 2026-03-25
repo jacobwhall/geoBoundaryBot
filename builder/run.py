@@ -34,12 +34,19 @@ def sync_repo(path, remote, branch="main", lfs=False):
     from pathlib import Path
 
     path = Path(path)
-    git = ["git", "-C", str(path)]
+
+    # Mark directory safe so git doesn't reject cross-user ownership on the PVC
+    subprocess.run(
+        ["git", "config", "--global", "--add", "safe.directory", str(path)],
+        check=True,
+    )
 
     if (path / ".git").is_dir():
         log.info("Pulling %s", path)
-        subprocess.run([*git, "fetch", "--all"], check=True)
-        subprocess.run([*git, "reset", "--hard", f"origin/{branch}"], check=True)
+        subprocess.run(["git", "fetch", "--all"], cwd=path, check=True)
+        subprocess.run(
+            ["git", "reset", "--hard", f"origin/{branch}"], cwd=path, check=True
+        )
     else:
         log.info("Cloning %s → %s", remote, path)
         path.mkdir(parents=True, exist_ok=True)
