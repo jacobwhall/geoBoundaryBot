@@ -378,7 +378,9 @@ def filter_attributes(gdf, adm_level):
     if "shapeName" not in result.columns:
         if adm_level == "ADM0":
             # For ADM0, use the ISO name lookup
-            result["shapeName"] = result["shapeID"].map(get_iso_name_lookup()).fillna("")
+            result["shapeName"] = (
+                result["shapeID"].map(get_iso_name_lookup()).fillna("")
+            )
             # Fallback to original name if lookup fails
             if result["shapeName"].empty or result["shapeName"].isna().all():
                 result["shapeName"] = result.get("NAME_0", result.get("NAME", ""))
@@ -599,8 +601,14 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    level = logging.WARNING if args.verbose == 0 else (logging.INFO if args.verbose == 1 else logging.DEBUG)
-    logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    level = (
+        logging.WARNING
+        if args.verbose == 0
+        else (logging.INFO if args.verbose == 1 else logging.DEBUG)
+    )
+    logging.basicConfig(
+        level=level, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
 
     try:
         logger.info("Starting CGAZ boundary processing...")

@@ -14,11 +14,26 @@ Orchestrates the full build:
   8. Exit 0 on success, 1 on failure
 """
 
+import mimetypes
+import boto3
 import logging
 import os
 import subprocess
+from kr8s.objects import Deployment, PersistentVolumeClaim, Service
 import sys
+from pathlib import Path
 import time
+from builder.paths import REPO_DIR
+from builder.paths import SOURCE_DATA
+from builder.paths import RELEASE_DATA
+from sqlalchemy import create_engine, text
+from builder.builder_class import builder
+from builder.paths import ISO_CSV, LICENSES_CSV, RELEASE_DATA
+import geopandas as gpd
+import pandas as pd
+from sqlalchemy import create_engine
+from dask.distributed import Client, as_completed
+from kr8s.objects import Job
 
 log = logging.getLogger(__name__)
 
@@ -29,9 +44,9 @@ PRODUCTS = ["gbOpen", "gbHumanitarian", "gbAuthoritative"]
 # Step 1 — Repo sync
 # ---------------------------------------------------------------------------
 
+
 def sync_repo(path, remote, branch="main", lfs=False):
     """Clone or pull a git repository on the mounted PVC."""
-    from pathlib import Path
 
     path = Path(path)
 
@@ -50,9 +65,7 @@ def sync_repo(path, remote, branch="main", lfs=False):
     else:
         log.info("Cloning %s → %s", remote, path)
         path.mkdir(parents=True, exist_ok=True)
-        subprocess.run(
-            ["git", "clone", "--depth", "1", remote, str(path)], check=True
-        )
+        subprocess.run(["git", "clone", "--depth", "1", remote, str(path)], check=True)
 
     if lfs:
         subprocess.run(["git", "lfs", "install"], cwd=path, check=True)
@@ -61,7 +74,6 @@ def sync_repo(path, remote, branch="main", lfs=False):
 
 def sync_data_repo():
     """Sync the geoBoundaries data repo on the mounted PVC."""
-    from builder.paths import REPO_DIR
 
     data_remote = os.environ.get(
         "GB_DATA_REPO", "https://github.com/wmgeolab/geoBoundaries.git"
@@ -76,12 +88,30 @@ def sync_data_repo():
 # Step 2/7 — Ephemeral PostGIS via kr8s
 # ---------------------------------------------------------------------------
 
+
+def _delete_and_wait(obj, timeout=60):
+    """Delete a k8s resource and wait for it to be fully gone."""
+    try:
+        obj.delete()
+        log.info("Deleting %s/%s", obj.kind, obj.name)
+    except Exception:
+        return  # doesn't exist
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            obj.refresh()
+        except Exception:
+            return  # gone
+        time.sleep(2)
+    log.warning("Timed out waiting for %s/%s deletion", obj.kind, obj.name)
+
+
 def create_build_db(timeout=120):
     """Create an ephemeral PostGIS PVC + Deployment + Service for build outputs.
 
     Returns the connection URL.
     """
-    from kr8s.objects import Deployment, PersistentVolumeClaim, Service
 
     release = os.environ["GB_RELEASE_NAME"]
     ns = os.environ.get("GB_NAMESPACE", "default")
@@ -102,81 +132,103 @@ def create_build_db(timeout=120):
     if storage_class:
         pvc_spec["storageClassName"] = storage_class
 
-    pvc = PersistentVolumeClaim({
-        "apiVersion": "v1",
-        "kind": "PersistentVolumeClaim",
-        "metadata": {"name": name, "namespace": ns, "labels": labels},
-        "spec": pvc_spec,
-    })
+    pvc = PersistentVolumeClaim(
+        {
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {"name": name, "namespace": ns, "labels": labels},
+            "spec": pvc_spec,
+        }
+    )
 
-    deploy = Deployment({
-        "apiVersion": "apps/v1",
-        "kind": "Deployment",
-        "metadata": {"name": name, "namespace": ns, "labels": labels},
-        "spec": {
-            "replicas": 1,
-            "selector": {"matchLabels": labels},
-            "template": {
-                "metadata": {"labels": labels},
-                "spec": {
-                    "securityContext": {
-                        "runAsUser": 999,
-                        "runAsGroup": 999,
-                        "fsGroup": 999,
-                    },
-                    "containers": [{
-                        "name": "postgis",
-                        "image": image,
-                        "env": [
-                            {"name": "POSTGRES_DB", "value": "geoboundaries"},
-                            {"name": "POSTGRES_USER", "value": "gb"},
-                            {"name": "POSTGRES_PASSWORD", "value": "builddb"},
-                            {"name": "PGDATA", "value": "/var/lib/postgresql/data/pgdata"},
-                        ],
-                        "ports": [{"containerPort": 5432}],
-                        "readinessProbe": {
-                            "exec": {
-                                "command": [
-                                    "pg_isready", "-U", "gb", "-d", "geoboundaries",
-                                ],
-                            },
-                            "initialDelaySeconds": 5,
-                            "periodSeconds": 5,
+    deploy = Deployment(
+        {
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": name, "namespace": ns, "labels": labels},
+            "spec": {
+                "replicas": 1,
+                "selector": {"matchLabels": labels},
+                "template": {
+                    "metadata": {"labels": labels},
+                    "spec": {
+                        "securityContext": {
+                            "runAsUser": 999,
+                            "runAsGroup": 999,
+                            "fsGroup": 999,
                         },
-                        "volumeMounts": [{
-                            "name": "pgdata",
-                            "mountPath": "/var/lib/postgresql/data",
-                        }],
-                    }],
-                    "volumes": [{
-                        "name": "pgdata",
-                        "persistentVolumeClaim": {"claimName": name},
-                    }],
+                        "containers": [
+                            {
+                                "name": "postgis",
+                                "image": image,
+                                "env": [
+                                    {"name": "POSTGRES_DB", "value": "geoboundaries"},
+                                    {"name": "POSTGRES_USER", "value": "gb"},
+                                    {"name": "POSTGRES_PASSWORD", "value": "builddb"},
+                                    {
+                                        "name": "PGDATA",
+                                        "value": "/var/lib/postgresql/data/pgdata",
+                                    },
+                                ],
+                                "ports": [{"containerPort": 5432}],
+                                "readinessProbe": {
+                                    "exec": {
+                                        "command": [
+                                            "pg_isready",
+                                            "-U",
+                                            "gb",
+                                            "-d",
+                                            "geoboundaries",
+                                        ],
+                                    },
+                                    "initialDelaySeconds": 5,
+                                    "periodSeconds": 5,
+                                },
+                                "volumeMounts": [
+                                    {
+                                        "name": "pgdata",
+                                        "mountPath": "/var/lib/postgresql/data",
+                                    }
+                                ],
+                            }
+                        ],
+                        "volumes": [
+                            {
+                                "name": "pgdata",
+                                "persistentVolumeClaim": {"claimName": name},
+                            }
+                        ],
+                    },
                 },
             },
-        },
-    })
+        }
+    )
 
-    svc = Service({
-        "apiVersion": "v1",
-        "kind": "Service",
-        "metadata": {"name": name, "namespace": ns, "labels": labels},
-        "spec": {
-            "selector": labels,
-            "ports": [{"port": 5432, "targetPort": 5432}],
-        },
-    })
+    svc = Service(
+        {
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {"name": name, "namespace": ns, "labels": labels},
+            "spec": {
+                "selector": labels,
+                "ports": [{"port": 5432, "targetPort": 5432}],
+            },
+        }
+    )
 
-    log.info("Creating build database: %s (%s on %s)", name, storage_size,
-             storage_class or "default storage class")
+    log.info(
+        "Creating build database: %s (%s on %s)",
+        name,
+        storage_size,
+        storage_class or "default storage class",
+    )
 
-    # Clean up leftover resources from any previous run
-    for obj in (deploy, svc, pvc):
-        try:
-            obj.delete()
-            log.info("Deleted existing %s/%s", obj.kind, obj.name)
-        except Exception:
-            pass
+    # Clean up leftover resources from any previous run (order matters:
+    # Deployment must be gone before PVC, or the pvc-protection finalizer
+    # keeps the PVC in Terminating state).
+    _delete_and_wait(deploy)
+    _delete_and_wait(svc)
+    _delete_and_wait(pvc)
 
     pvc.create()
     deploy.create()
@@ -192,9 +244,7 @@ def create_build_db(timeout=120):
         log.info("Waiting for build database…")
         time.sleep(5)
     else:
-        raise TimeoutError(
-            f"Build database did not become ready within {timeout}s"
-        )
+        raise TimeoutError(f"Build database did not become ready within {timeout}s")
 
     db_url = f"postgresql://gb:builddb@{name}:5432/geoboundaries"
 
@@ -214,12 +264,12 @@ def create_build_db(timeout=120):
 
 def _init_build_db_schema(db_url):
     """Enable PostGIS and create the boundaries table."""
-    from sqlalchemy import create_engine, text
 
     engine = create_engine(db_url)
     with engine.begin() as conn:
         conn.execute(text("CREATE EXTENSION IF NOT EXISTS postgis"))
-        conn.execute(text("""
+        conn.execute(
+            text("""
             CREATE TABLE IF NOT EXISTS boundaries (
                 id SERIAL PRIMARY KEY,
                 product TEXT NOT NULL,
@@ -231,18 +281,20 @@ def _init_build_db_schema(db_url):
                 shape_type TEXT,
                 geom geometry(Geometry, 4326)
             )
-        """))
-        conn.execute(text(
-            "CREATE INDEX IF NOT EXISTS idx_boundaries_lookup "
-            "ON boundaries (product, iso, adm_level)"
-        ))
+        """)
+        )
+        conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS idx_boundaries_lookup "
+                "ON boundaries (product, iso, adm_level)"
+            )
+        )
     engine.dispose()
     log.info("Build database schema initialized")
 
 
 def teardown_build_db():
     """Delete the ephemeral PostGIS PVC, Deployment, and Service."""
-    from kr8s.objects import Deployment, PersistentVolumeClaim, Service
 
     release = os.environ["GB_RELEASE_NAME"]
     ns = os.environ.get("GB_NAMESPACE", "default")
@@ -261,9 +313,9 @@ def teardown_build_db():
 # Step 3/5 — Dask scaling via kr8s
 # ---------------------------------------------------------------------------
 
+
 def scale_dask_workers(replicas, timeout=300):
     """Scale the Dask worker Deployment via the Kubernetes API."""
-    from kr8s.objects import Deployment
 
     release = os.environ["GB_RELEASE_NAME"]
     ns = os.environ.get("GB_NAMESPACE", "default")
@@ -292,9 +344,9 @@ def scale_dask_workers(replicas, timeout=300):
 # Step 4 — Boundary builds via Dask
 # ---------------------------------------------------------------------------
 
+
 def discover_boundaries(products=None):
     """Scan sourceData/ for ZIP files and return (product, iso, adm) tuples."""
-    from builder.paths import SOURCE_DATA
 
     products = products or PRODUCTS
     boundaries = []
@@ -321,9 +373,6 @@ def upload_to_s3(product, iso, adm, s3_config):
         {product}/{ISO}/{ADM}/geoBoundaries-{ISO}-{ADM}-metaData.json
         ...
     """
-    import mimetypes
-    import boto3
-    from builder.paths import RELEASE_DATA
 
     output_dir = RELEASE_DATA / product / iso / adm
     if not output_dir.is_dir():
@@ -355,7 +404,11 @@ def upload_to_s3(product, iso, adm, s3_config):
 
 
 def build_boundary(
-    product: str, iso: str, adm: str, db_url: str, s3_config: dict | None = None,
+    product: str,
+    iso: str,
+    adm: str,
+    db_url: str,
+    s3_config: dict | None = None,
 ) -> dict:
     """Process a single boundary.  Runs on a Dask worker.
 
@@ -363,11 +416,6 @@ def build_boundary(
       - pushes the output geometry to PostGIS for CGAZ
       - uploads all output files to S3 (if configured)
     """
-    from builder.builder_class import builder
-    from builder.paths import ISO_CSV, LICENSES_CSV, RELEASE_DATA
-    import geopandas as gpd
-    import pandas as pd
-    from sqlalchemy import create_engine
 
     iso_list = pd.read_csv(ISO_CSV)
     license_list = pd.read_csv(LICENSES_CSV)
@@ -398,8 +446,7 @@ def build_boundary(
     # Push the built boundary to PostGIS for downstream CGAZ consumption.
     try:
         geojson_path = (
-            RELEASE_DATA / product / iso / adm
-            / f"geoBoundaries-{iso}-{adm}.geojson"
+            RELEASE_DATA / product / iso / adm / f"geoBoundaries-{iso}-{adm}.geojson"
         )
         if geojson_path.exists():
             gdf = gpd.read_file(geojson_path)
@@ -411,7 +458,10 @@ def build_boundary(
 
             engine = create_engine(db_url)
             gdf.to_postgis(
-                "boundaries", engine, if_exists="append", index=False,
+                "boundaries",
+                engine,
+                if_exists="append",
+                index=False,
             )
             engine.dispose()
     except Exception as e:
@@ -430,7 +480,6 @@ def build_boundary(
 
 def run_boundary_builds(scheduler_url, db_url, s3_config=None):
     """Connect to Dask, discover boundaries, fan out work. Returns (ok, fail) counts."""
-    from dask.distributed import Client
 
     log.info("Connecting to Dask scheduler at %s", scheduler_url)
     client = Client(scheduler_url)
@@ -445,7 +494,11 @@ def run_boundary_builds(scheduler_url, db_url, s3_config=None):
 
     futures = {
         client.submit(
-            build_boundary, product, iso, adm, db_url,
+            build_boundary,
+            product,
+            iso,
+            adm,
+            db_url,
             s3_config=s3_config,
             key=f"{product}-{iso}-{adm}",
         ): (product, iso, adm)
@@ -455,7 +508,7 @@ def run_boundary_builds(scheduler_url, db_url, s3_config=None):
     succeeded, failed = 0, 0
     t0 = time.monotonic()
 
-    for future, result in client.as_completed(futures, with_results=True):
+    for future, result in as_completed(futures, with_results=True):
         tag = f"{result['product']}/{result['iso']}_{result['adm']}"
         if result["status"] == "ok":
             succeeded += 1
@@ -472,7 +525,9 @@ def run_boundary_builds(scheduler_url, db_url, s3_config=None):
     elapsed = time.monotonic() - t0
     log.info(
         "Boundary builds: %d succeeded, %d failed in %.0fs",
-        succeeded, failed, elapsed,
+        succeeded,
+        failed,
+        elapsed,
     )
     return succeeded, failed
 
@@ -481,9 +536,9 @@ def run_boundary_builds(scheduler_url, db_url, s3_config=None):
 # Step 6 — CGAZ Job via kr8s
 # ---------------------------------------------------------------------------
 
+
 def run_cgaz_job(db_url, timeout=7200):
     """Create a one-shot Kubernetes Job for CGAZ processing and wait for it."""
-    from kr8s.objects import Job
 
     release = os.environ["GB_RELEASE_NAME"]
     ns = os.environ.get("GB_NAMESPACE", "default")
@@ -512,8 +567,10 @@ def run_cgaz_job(db_url, timeout=7200):
                             "name": "cgaz",
                             "image": image,
                             "command": [
-                                "python", "-m",
-                                "builder.cgaz_builder", "-vv",
+                                "python",
+                                "-m",
+                                "builder.cgaz_builder",
+                                "-vv",
                             ],
                             "env": [
                                 {
@@ -565,6 +622,7 @@ def run_cgaz_job(db_url, timeout=7200):
 # ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
+
 
 def main():
     logging.basicConfig(

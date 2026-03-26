@@ -55,7 +55,7 @@ dask:
       volumes:
         - name: data
           persistentVolumeClaim:
-            claimName: gb-data
+            claimName: geoboundaries-data
       volumeMounts:
         - name: data
           mountPath: /data/geoBoundaries

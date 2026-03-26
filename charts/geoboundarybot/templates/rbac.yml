@@ -17,14 +17,14 @@ rules:
   # Scale Dask workers + create/delete ephemeral PostGIS
   - apiGroups: ["apps"]
     resources: ["deployments"]
-    verbs: ["get", "create", "patch", "delete"]
+    verbs: ["get", "list", "create", "patch", "delete"]
   - apiGroups: ["apps"]
     resources: ["deployments/scale"]
     verbs: ["get", "patch", "update"]
   # Ephemeral PostGIS Service + PVC
   - apiGroups: [""]
     resources: ["services", "persistentvolumeclaims"]
-    verbs: ["get", "create", "delete"]
+    verbs: ["get", "list", "create", "delete"]
   # Create and monitor the CGAZ Job
   - apiGroups: ["batch"]
     resources: ["jobs"]

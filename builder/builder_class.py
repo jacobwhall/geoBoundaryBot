@@ -460,10 +460,19 @@ class builder:
 
             try:
                 result = subprocess.run(
-                    ["git", "log", "-1", "--format=%cd", "-p", "--",
-                     str(self.sourcePath)],
+                    [
+                        "git",
+                        "log",
+                        "-1",
+                        "--format=%cd",
+                        "-p",
+                        "--",
+                        str(self.sourcePath),
+                    ],
                     cwd=str(self.sourceFolder),
-                    capture_output=True, text=True, timeout=30,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
                 )
                 sourceDataDate = result.stdout.strip()
                 self.metaDataLib["sourceDataUpdateDate"] = (
@@ -477,9 +486,7 @@ class builder:
                         "GIT LOCAL API - Source Data Update Date: "
                         + str(sourceDataDate)
                     )
-                    return (
-                        "ERROR: The source data date was unable to be calculated during build (blank result)."
-                    )
+                    return "ERROR: The source data date was unable to be calculated during build (blank result)."
                 else:
                     self.logger.info(
                         "GIT source date found: "
@@ -1198,14 +1205,25 @@ class builder:
         writeRet = []
         self.logger.info("Running mapshaper (full resolution)")
         mapshaper_full = [
-            "mapshaper-xl", "6gb", str(tmpJson),
-            "-clean", "gap-fill-area=500m2", "snap-interval=.00001",
-            "-o", f"format=shapefile", str(shpOUT),
-            "-o", f"format=topojson", str(topoOUT),
-            "-o", f"format=geojson", str(jsonOUT),
+            "mapshaper-xl",
+            "6gb",
+            str(tmpJson),
+            "-clean",
+            "gap-fill-area=500m2",
+            "snap-interval=.00001",
+            "-o",
+            f"format=shapefile",
+            str(shpOUT),
+            "-o",
+            f"format=topojson",
+            str(topoOUT),
+            "-o",
+            f"format=geojson",
+            str(jsonOUT),
         ]
-        result = subprocess.run(mapshaper_full, capture_output=True, text=True,
-                                timeout=600)
+        result = subprocess.run(
+            mapshaper_full, capture_output=True, text=True, timeout=600
+        )
         ret_code = result.returncode
         if ret_code != 0:
             self.logger.error("mapshaper stderr: %s", result.stderr)
@@ -1251,15 +1269,29 @@ class builder:
 
         self.logger.info("Running mapshaper (simplified)")
         mapshaper_simp = [
-            "mapshaper-xl", "6gb", str(tmpJson),
-            "-simplify", "dp", "interval=100", "keep-shapes",
-            "-clean", "gap-fill-area=500m2", "snap-interval=.00001",
-            "-o", f"format=shapefile", str(shpOUT_simp),
-            "-o", f"format=topojson", str(topoOUT_simp),
-            "-o", f"format=geojson", str(jsonOUT_simp),
+            "mapshaper-xl",
+            "6gb",
+            str(tmpJson),
+            "-simplify",
+            "dp",
+            "interval=100",
+            "keep-shapes",
+            "-clean",
+            "gap-fill-area=500m2",
+            "snap-interval=.00001",
+            "-o",
+            f"format=shapefile",
+            str(shpOUT_simp),
+            "-o",
+            f"format=topojson",
+            str(topoOUT_simp),
+            "-o",
+            f"format=geojson",
+            str(jsonOUT_simp),
         ]
-        result_simp = subprocess.run(mapshaper_simp, capture_output=True, text=True,
-                                     timeout=600)
+        result_simp = subprocess.run(
+            mapshaper_simp, capture_output=True, text=True, timeout=600
+        )
         if result_simp.returncode != 0:
             self.logger.error("mapshaper (simplified) stderr: %s", result_simp.stderr)
         writeRet.append(result_simp.returncode)
