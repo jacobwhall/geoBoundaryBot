@@ -65,7 +65,7 @@ def sync_repo(path, remote, branch="main", lfs=False):
     else:
         log.info("Cloning %s → %s", remote, path)
         path.mkdir(parents=True, exist_ok=True)
-        subprocess.run(["git", "clone", "--depth", "1", remote, str(path)], check=True)
+        subprocess.run(["git", "clone", remote, str(path)], check=True)
 
     if lfs:
         subprocess.run(["git", "lfs", "install"], cwd=path, check=True)
