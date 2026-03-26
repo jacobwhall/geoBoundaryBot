@@ -417,9 +417,11 @@ def build_boundary(
       - uploads all output files to S3 (if configured)
     """
 
-    iso_list = pd.read_csv(ISO_CSV)
-    license_list = pd.read_csv(LICENSES_CSV)
-    b = builder(iso, adm, product, iso_list, license_list)
+    iso_df = pd.read_csv(ISO_CSV)
+    license_df = pd.read_csv(LICENSES_CSV)
+    valid_isos = iso_df["Alpha-3code"].tolist()
+    valid_licenses = license_df["license_name"].tolist()
+    b = builder(iso, adm, product, valid_isos, valid_licenses)
 
     result = {"product": product, "iso": iso, "adm": adm}
     for stage_name, stage_fn in [
