@@ -35,6 +35,9 @@ dask:
       repository: ghcr.io/wmgeolab/geoboundarybot
       tag: latest
     serviceType: ClusterIP
+    env:
+      - name: PYTHONPATH
+        value: /app
 
   worker:
     replicas: 0 # run.py scales workers up/down during builds
@@ -42,6 +45,8 @@ dask:
       repository: ghcr.io/wmgeolab/geoboundarybot
       tag: latest
     env:
+      - name: PYTHONPATH
+        value: /app
       - name: GB_REPO_DIR
         value: /data/geoBoundaries
     resources:

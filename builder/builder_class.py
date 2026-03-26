@@ -321,18 +321,18 @@ class builder:
                         "ERROR: Invalid release type detected."
                     )
                 else:
-                    if val.lower() not in self.sourcePath.lower():
+                    if val.lower() not in str(self.sourcePath).lower():
                         self.logger.critical(
                             "ERROR: Mismatch between release type and the folder the source zip file was located in."
                             + str(val.lower())
                             + " | "
-                            + str(self.sourcePath.lower())
+                            + str(str(self.sourcePath).lower())
                         )
                         self.metaReq["releaseType"] = (
                             "ERROR: Mismatch between release type and the folder the source zip file was located in: "
                             + str(val.lower())
                             + " | "
-                            + str(self.sourcePath.lower())
+                            + str(str(self.sourcePath).lower())
                         )
                     else:
                         self.metaReq["releaseType"] = val.lower().strip()
