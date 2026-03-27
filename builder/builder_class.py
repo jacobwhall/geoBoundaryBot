@@ -1213,7 +1213,6 @@ class builder:
         self.logger.info("Running mapshaper (full resolution)")
         mapshaper_full = [
             "mapshaper-xl",
-            "6gb",
             str(tmpJson),
             "-clean",
             "gap-fill-area=500m2",
@@ -1278,7 +1277,6 @@ class builder:
         self.logger.info("Running mapshaper (simplified)")
         mapshaper_simp = [
             "mapshaper-xl",
-            "6gb",
             str(tmpJson),
             "-simplify",
             "dp",
