@@ -1185,7 +1185,8 @@ class builder:
         logStr = "Building shapefiles, geojson, topojson (Full) with: " + str(tmpJson)
         self.logger.info(logStr)
         try:
-            self.geomDta.to_file(tmpJson, driver="GeoJSON", crs="EPSG:4326")
+            self.geomDta = self.geomDta.to_crs("EPSG:4326")
+            self.geomDta.to_file(tmpJson, driver="GeoJSON")
             self.logger.info("Intermediary GeoJSON export succeeded.")
         except Exception as e:
             self.logger.info(f"Intermediary GeoJSON export failed: {e}")
@@ -1199,7 +1200,7 @@ class builder:
                         else str(x)
                     )
 
-            self.geomDta.to_file(tmpJson, driver="GeoJSON", crs="EPSG:4326")
+            self.geomDta.to_file(tmpJson, driver="GeoJSON")
             self.logger.info("Intermediary GeoJSON export succeeded after coercion.")
 
         writeRet = []
@@ -1260,7 +1261,8 @@ class builder:
                 f"Successfully read {len(tmpGeomJSONproj_multi)} features from {jsonOUT}"
             )
             # tmpGeomJSONproj_multi = tmpGeomJSONproj.geometry.apply(to_multipolygon)
-            tmpGeomJSONproj_multi.to_file(jsonOUT, driver="GeoJSON", crs="EPSG:4326")
+            tmpGeomJSONproj_multi = tmpGeomJSONproj_multi.to_crs("EPSG:4326")
+            tmpGeomJSONproj_multi.to_file(jsonOUT, driver="GeoJSON")
         except Exception as e:
             self.logger.error(f"Failed to read/write GeoJSON: {str(e)}")
             return f"ERROR: Failed to read/write GeoJSON: {str(e)}"
@@ -1300,9 +1302,8 @@ class builder:
         # the projection outputs, or if our tests were ill-formed.
         tmpGeomJSONproj_simplified_multi = gpd.read_file(jsonOUT_simp)
         # tmpGeomJSONproj_simplified_multi = tmpGeomJSONproj_simplified.geometry.apply(to_multipolygon)
-        tmpGeomJSONproj_simplified_multi.to_file(
-            jsonOUT_simp, driver="GeoJSON", crs="EPSG:4326"
-        )
+        tmpGeomJSONproj_simplified_multi = tmpGeomJSONproj_simplified_multi.to_crs("EPSG:4326")
+        tmpGeomJSONproj_simplified_multi.to_file(jsonOUT_simp, driver="GeoJSON")
 
         # Create the plot for the boundary to be used in display
         self.logger.info("Plotting preview image.")
