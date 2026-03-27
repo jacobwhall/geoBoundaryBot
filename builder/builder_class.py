@@ -20,10 +20,14 @@ from builder.paths import SOURCE_DATA, RELEASE_DATA, TMP_DIR
 
 
 class builder:
-    def __init__(self, ISO, ADM, product, validISO, validLicense):
+    def __init__(self, ISO, ADM, product, validISO, validLicense, tmpdir=None):
         os.environ.setdefault("OGR_GEOJSON_MAX_OBJ_SIZE", "0")
 
         self.logger = logging.getLogger(f"builder.{product}.{ISO}_{ADM}")
+
+        if tmpdir is None:
+            tmpdir = TMP_DIR
+        self.tmpdir = Path(tmpdir)
 
         # Basic attributes
         self.ISO = ISO
@@ -31,8 +35,8 @@ class builder:
         self.product = product
         self.sourceFolder = SOURCE_DATA / product
         self.sourcePath = SOURCE_DATA / product / f"{ISO}_{ADM}.zip"
-        self.targetPath = RELEASE_DATA / product / ISO / ADM
-        self.zipExtractPath = TMP_DIR / product / f"{ISO}_{ADM}"
+        self.targetPath = self.tmpdir / "release" / product / ISO / ADM
+        self.zipExtractPath = self.tmpdir / "extract" / product / f"{ISO}_{ADM}"
         self.validISO = validISO
         self.validLicense = [x.lower().strip() for x in validLicense]
 
@@ -995,7 +999,7 @@ class builder:
         try:
             self.logger.info("Checking if geometry size has changed.")
             base_name = f"geoBoundaries-{self.ISO}-{self.ADM}"
-            tmpFold = TMP_DIR / f"{self.ISO}{self.ADM}{self.product}"
+            tmpFold = self.tmpdir / f"{self.ISO}{self.ADM}{self.product}"
             newJSON = tmpFold / f"{base_name}.geojson"
             oldJSON = self.targetPath / f"{base_name}.geojson"
 
@@ -1071,7 +1075,7 @@ class builder:
             self.cleanup_target_directory()
         base_name = f"geoBoundaries-{self.ISO}-{self.ADM}"
         tmpFold = TMP_DIR / f"{self.ISO}{self.ADM}{self.product}"
-        tmpJson = TMP_DIR / f"{self.ISO}{self.ADM}{self.product}.geoJSON"
+        tmpJson = self.tmpdir / f"{self.ISO}{self.ADM}{self.product}.geoJSON"
 
         # Simplified versions
         jsonOUT_simp = tmpFold / f"{base_name}_simplified.geojson"
@@ -1348,7 +1352,7 @@ class builder:
 
         if self.changesDetected == True:
             self.logger.info("Building zip files.")
-            zip_interim = TMP_DIR / "zipInterim" / self.product
+            zip_interim = self.tmpdir / "zipInterim" / self.product
             zip_interim.mkdir(parents=True, exist_ok=True)
             zip_base = zip_interim / f"{base_name}-all"
             shutil.make_archive(str(zip_base), "zip", str(tmpFold))

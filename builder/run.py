@@ -19,13 +19,14 @@ import boto3
 import logging
 import os
 import subprocess
+import tempfile
 from kr8s.objects import Deployment, PersistentVolumeClaim, Service
 import sys
 from pathlib import Path
 import time
 from builder.paths import REPO_DIR
 from builder.paths import SOURCE_DATA
-from builder.paths import RELEASE_DATA
+from builder.paths import RELEASE_DATA, TMP_DIR
 from sqlalchemy import create_engine, text
 from builder.builder_class import builder
 from builder.paths import ISO_CSV, LICENSES_CSV, RELEASE_DATA
@@ -364,7 +365,7 @@ def discover_boundaries(products=None):
     return boundaries
 
 
-def upload_to_s3(product, iso, adm, s3_config):
+def upload_to_s3(output_dir, key_prefix, s3_config):
     """Upload all build outputs for a boundary to S3-compatible storage.
 
     Keys mirror the release directory structure so the bucket can be
@@ -372,11 +373,15 @@ def upload_to_s3(product, iso, adm, s3_config):
         {product}/{ISO}/{ADM}/geoBoundaries-{ISO}-{ADM}.geojson
         {product}/{ISO}/{ADM}/geoBoundaries-{ISO}-{ADM}-metaData.json
         ...
+
+    Args:
+        output_dir: Path to the directory containing build outputs.
+        key_prefix: Prefix for S3 keys (e.g. "gbOpen/USA/ADM1").
+        s3_config: Dict with endpoint, access_key_id, secret_access_key, bucket.
     """
 
-    output_dir = RELEASE_DATA / product / iso / adm
     if not output_dir.is_dir():
-        log.warning("No output dir for %s/%s_%s, skipping S3 upload", product, iso, adm)
+        log.warning("No output dir %s, skipping S3 upload", output_dir)
         return
 
     s3 = boto3.client(
@@ -386,21 +391,21 @@ def upload_to_s3(product, iso, adm, s3_config):
         aws_secret_access_key=s3_config["secret_access_key"],
     )
     bucket = s3_config["bucket"]
-    prefix = s3_config.get("prefix", "")
+    global_prefix = s3_config.get("prefix", "")
 
     for file_path in output_dir.rglob("*"):
         if not file_path.is_file():
             continue
-        key = str(file_path.relative_to(RELEASE_DATA))
-        if prefix:
-            key = f"{prefix}/{key}"
+        key = f"{key_prefix}/{file_path.relative_to(output_dir)}"
+        if global_prefix:
+            key = f"{global_prefix}/{key}"
         content_type, _ = mimetypes.guess_type(str(file_path))
         extra_args = {}
         if content_type:
             extra_args["ContentType"] = content_type
         s3.upload_file(str(file_path), bucket, key, ExtraArgs=extra_args)
 
-    log.info("Uploaded %s/%s_%s to s3://%s/", product, iso, adm, bucket)
+    log.info("Uploaded %s to s3://%s/", key_prefix, bucket)
 
 
 def build_boundary(
@@ -417,11 +422,14 @@ def build_boundary(
       - uploads all output files to S3 (if configured)
     """
 
+    tmpdir = tempfile.mkdtemp(prefix=f"gb-{product}-{iso}-{adm}-")
+    tmpdir = Path(tmpdir)
+
     iso_df = pd.read_csv(ISO_CSV)
     license_df = pd.read_csv(LICENSES_CSV)
     valid_isos = iso_df["Alpha-3code"].tolist()
     valid_licenses = license_df["license_name"].tolist()
-    b = builder(iso, adm, product, valid_isos, valid_licenses)
+    b = builder(iso, adm, product, valid_isos, valid_licenses, tmpdir=tmpdir)
 
     result = {"product": product, "iso": iso, "adm": adm}
     for stage_name, stage_fn in [
@@ -448,7 +456,7 @@ def build_boundary(
     # Push the built boundary to PostGIS for downstream CGAZ consumption.
     try:
         geojson_path = (
-            RELEASE_DATA / product / iso / adm / f"geoBoundaries-{iso}-{adm}.geojson"
+            b.targetPath / f"geoBoundaries-{iso}-{adm}.geojson"
         )
         if geojson_path.exists():
             gdf = gpd.read_file(geojson_path)
@@ -472,7 +480,7 @@ def build_boundary(
     # Upload all outputs to S3-compatible storage.
     if s3_config:
         try:
-            upload_to_s3(product, iso, adm, s3_config)
+            upload_to_s3(b.targetPath, f"{product}/{iso}/{adm}", s3_config)
         except Exception as e:
             log.warning("S3 upload failed for %s/%s_%s: %s", product, iso, adm, e)
 
