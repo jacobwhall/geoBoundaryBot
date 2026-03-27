@@ -467,7 +467,7 @@ class builder:
                         "--format=%cd",
                         "-p",
                         "--",
-                        str(self.sourcePath),
+                        self.sourcePath.name,
                     ],
                     cwd=str(self.sourceFolder),
                     capture_output=True,
