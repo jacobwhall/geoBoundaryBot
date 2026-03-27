@@ -9,6 +9,7 @@ import time
 import zipfile
 
 import geopandas as gpd
+from pathlib import Path
 import matplotlib.pyplot as plt
 import pandas as pd
 from shapely.geometry import shape
@@ -466,7 +467,8 @@ class builder:
                 result = subprocess.run(
                     [
                         "git",
-                        "-c", "safe.directory=*",
+                        "-c",
+                        "safe.directory=*",
                         "log",
                         "-1",
                         "--format=%cd",
@@ -1306,7 +1308,9 @@ class builder:
         # the projection outputs, or if our tests were ill-formed.
         tmpGeomJSONproj_simplified_multi = gpd.read_file(jsonOUT_simp)
         # tmpGeomJSONproj_simplified_multi = tmpGeomJSONproj_simplified.geometry.apply(to_multipolygon)
-        tmpGeomJSONproj_simplified_multi = tmpGeomJSONproj_simplified_multi.to_crs("EPSG:4326")
+        tmpGeomJSONproj_simplified_multi = tmpGeomJSONproj_simplified_multi.to_crs(
+            "EPSG:4326"
+        )
         tmpGeomJSONproj_simplified_multi.to_file(jsonOUT_simp, driver="GeoJSON")
 
         # Create the plot for the boundary to be used in display
