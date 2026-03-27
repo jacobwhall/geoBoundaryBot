@@ -462,10 +462,10 @@ class builder:
                 result = subprocess.run(
                     [
                         "git",
+                        "-c", "safe.directory=*",
                         "log",
                         "-1",
                         "--format=%cd",
-                        "-p",
                         "--",
                         self.sourcePath.name,
                     ],
