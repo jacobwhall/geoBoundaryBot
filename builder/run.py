@@ -464,7 +464,13 @@ def build_boundary(
             gdf["product"] = product
             gdf["iso"] = iso
             gdf["adm_level"] = adm
-            gdf = gdf.rename(columns={"geometry": "geom"}).set_geometry("geom")
+            gdf = gdf.rename(columns={
+                "geometry": "geom",
+                "shapeName": "shape_name",
+                "shapeID": "shape_id",
+                "shapeGroup": "shape_group",
+                "shapeType": "shape_type",
+            }).set_geometry("geom")
 
             engine = create_engine(db_url)
             gdf.to_postgis(
@@ -489,7 +495,11 @@ def build_boundary(
 
 
 def run_boundary_builds(scheduler_url, db_url, s3_config=None):
-    """Connect to Dask, discover boundaries, fan out work. Returns (ok, fail) counts."""
+    """Connect to Dask, discover boundaries, fan out work.
+
+    Returns (succeeded_count, failures) where failures is a list of the
+    per-boundary error dicts returned by `build_boundary`.
+    """
 
     log.info("Connecting to Dask scheduler at %s", scheduler_url)
     client = Client(scheduler_url)
@@ -500,7 +510,7 @@ def run_boundary_builds(scheduler_url, db_url, s3_config=None):
 
     if not boundaries:
         log.info("Nothing to build.")
-        return 0, 0
+        return 0, []
 
     futures = {
         client.submit(
@@ -515,7 +525,8 @@ def run_boundary_builds(scheduler_url, db_url, s3_config=None):
         for product, iso, adm in boundaries
     }
 
-    succeeded, failed = 0, 0
+    succeeded = 0
+    failures = []
     t0 = time.monotonic()
 
     for future, result in as_completed(futures, with_results=True):
@@ -524,7 +535,7 @@ def run_boundary_builds(scheduler_url, db_url, s3_config=None):
             succeeded += 1
             log.info("OK  %s", tag)
         else:
-            failed += 1
+            failures.append(result)
             log.error(
                 "FAIL %s stage=%s: %s",
                 tag,
@@ -536,10 +547,29 @@ def run_boundary_builds(scheduler_url, db_url, s3_config=None):
     log.info(
         "Boundary builds: %d succeeded, %d failed in %.0fs",
         succeeded,
-        failed,
+        len(failures),
         elapsed,
     )
-    return succeeded, failed
+    return succeeded, failures
+
+
+def log_failure_summary(failures, strict):
+    """Print a prominent, human-readable banner listing failed boundaries."""
+
+    header = "BUILD FAILURES (strict mode — aborting)" if strict else (
+        "UPSTREAM DATA ISSUES (non-strict mode — continuing)"
+    )
+    bar = "=" * 72
+
+    log.error(bar)
+    log.error("  %s", header)
+    log.error("  %d boundary build(s) failed", len(failures))
+    log.error(bar)
+    for f in failures:
+        tag = f"{f['product']}/{f['iso']}_{f['adm']}"
+        log.error("  %-30s [%s]", tag, f.get("failed_stage"))
+        log.error("    %s", f.get("error"))
+    log.error(bar)
 
 
 # ---------------------------------------------------------------------------
@@ -642,6 +672,8 @@ def main():
 
     dask_workers = int(os.environ.get("DASK_WORKERS", "4"))
     scheduler = os.environ.get("DASK_SCHEDULER", "tcp://localhost:8786")
+    strict = os.environ.get("GB_STRICT", "false").lower() == "true"
+    log.info("Strict mode: %s", "ON" if strict else "off")
 
     # Build S3 config from env vars (None if not configured)
     s3_config = None
@@ -675,11 +707,12 @@ def main():
         try:
             # 4. Run boundary builds
             log.info("=== Step 4: Running boundary builds ===")
-            succeeded, failed = run_boundary_builds(scheduler, db_url, s3_config)
+            succeeded, failures = run_boundary_builds(scheduler, db_url, s3_config)
 
-            if failed:
-                log.error("%d boundary builds failed", failed)
-                sys.exit(1)
+            if failures:
+                log_failure_summary(failures, strict=strict)
+                if strict:
+                    sys.exit(1)
         finally:
             # 5. Scale down Dask (always, even on failure)
             log.info("=== Step 5: Scaling Dask workers to 0 ===")

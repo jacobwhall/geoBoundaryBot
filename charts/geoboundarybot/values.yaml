@@ -6,6 +6,10 @@ image:
 # Nightly build CronJob
 build:
   schedule: "0 2 * * *"
+  # strict=true makes any boundary-build failure fail the whole pipeline
+  # (skip CGAZ, exit 1). Leave false for nightly runs so upstream data issues
+  # are surfaced but don't fail the Job. Set true for release runs.
+  strict: false
   sync:
     dataRepo: https://github.com/wmgeolab/geoBoundaries.git
     branch: main
@@ -88,20 +92,3 @@ builddb:
     tag: "17-3.5"
   storageClass: ""
   size: 250Gi
-
-# Cloudflare Tunnel
-# Create the token secret before install:
-#   kubectl create secret generic cloudflared-token --from-literal=token=<your-token>
-cloudflared:
-  replicas: 2
-  image:
-    repository: cloudflare/cloudflared
-    tag: "2026.2.0"
-  tokenSecret: cloudflared-token
-  resources:
-    requests:
-      memory: 256Mi
-      cpu: 100m
-    limits:
-      memory: 512Mi
-      cpu: 500m

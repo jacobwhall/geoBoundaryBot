@@ -40,6 +40,8 @@ spec:
                   value: "tcp://{{ .Release.Name }}-dask-scheduler:8786"
                 - name: DASK_WORKERS
                   value: {{ .Values.build.dask.workers | quote }}
+                - name: GB_STRICT
+                  value: {{ .Values.build.strict | quote }}
                 - name: GB_POSTGIS_IMAGE
                   value: "{{ .Values.builddb.image.repository }}:{{ .Values.builddb.image.tag }}"
                 - name: GB_BUILDDB_STORAGE_CLASS
