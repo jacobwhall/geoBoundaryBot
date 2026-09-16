@@ -1,45 +1,57 @@
 name: 'geoBoundaryBot PR Response'
-description: 'Generate PR response text from check results'
+description: 'Generate a bounded PR comment from untrusted validation result artifacts'
 
 inputs:
-  gitsha:
-    description: 'Git SHA of the PR head, used for artifact URL construction'
+  results-dir:
+    description: 'Absolute directory containing the three downloaded result directories'
     required: true
+  run-url:
+    description: 'Verified URL of the triggering validation workflow run'
+    required: true
+  validated-sha:
+    description: 'Full PR head SHA independently associated with the workflow run'
+    required: true
+  run-conclusion:
+    description: 'Conclusion of the triggering validation workflow run'
+    required: true
+  expected-pr-number:
+    description: 'PR number independently associated with the workflow run'
+    required: true
+  context-dir:
+    description: 'Optional directory containing the downloaded context.json artifact'
+    required: false
+    default: ''
 
 outputs:
-  response-text:
-    description: 'The generated PR response markdown'
-    value: ${{ steps.respond.outputs.response_text }}
+  response-file:
+    description: 'Absolute path of the UTF-8 PR comment body file'
+    value: ${{ steps.respond.outputs.response_file }}
 
 runs:
   using: 'composite'
   steps:
-    - name: Link bot repo for compatibility
-      shell: bash
-      run: ln -sfn "${{ github.action_path }}/../.." "$GITHUB_WORKSPACE/geoBoundaryBot"
-
-    - name: Create working directories
-      shell: bash
-      run: mkdir -p ~/tmp
-
-    - name: Install uv
-      uses: astral-sh/setup-uv@v7
-
-    - name: Install dependencies
-      shell: bash
-      working-directory: ${{ github.action_path }}/../..
-      run: uv sync --locked
-
+    # No uv or dependency install on purpose: this action runs in the
+    # privileged reporter (pull-requests: write) over untrusted artifact text.
+    # utils/response.py is stdlib-only and must stay that way -- adding a
+    # third-party import here means installing packages next to the write token.
     - name: Generate response
       id: respond
       shell: bash
+      working-directory: ${{ github.action_path }}/../..
       env:
+        CONTEXT_DIR: ${{ inputs.context-dir }}
+        EXPECTED_PR_NUMBER: ${{ inputs.expected-pr-number }}
         PYTHONPATH: ${{ github.action_path }}/../..
-        gitsha: ${{ inputs.gitsha }}
+        RESULTS_DIR: ${{ inputs.results-dir }}
+        RUN_CONCLUSION: ${{ inputs.run-conclusion }}
+        RUN_URL: ${{ inputs.run-url }}
+        VALIDATED_SHA: ${{ inputs.validated-sha }}
       run: |
-        uv --project "${{ github.action_path }}/../.." run python -m utils.response
-        {
-          echo "response_text<<GHEOF"
-          cat ~/tmp/response.txt
-          echo "GHEOF"
-        } >> "$GITHUB_OUTPUT"
+        response_file="$(python3 -m utils.response \
+          --results-dir "$RESULTS_DIR" \
+          --run-url "$RUN_URL" \
+          --validated-sha "$VALIDATED_SHA" \
+          --run-conclusion "$RUN_CONCLUSION" \
+          --expected-pr-number "$EXPECTED_PR_NUMBER" \
+          --context-dir "$CONTEXT_DIR")"
+        printf 'response_file=%s\n' "$response_file" >> "$GITHUB_OUTPUT"

@@ -4,6 +4,7 @@ import json
 import pandas as pd
 import geopandas
 from datetime import datetime
+from pathlib import Path
 import requests
 
 # Initialize workspace
@@ -17,7 +18,8 @@ except:
 
 # Load in the ISO lookup table
 isoDetails = pd.read_csv(
-    ws["working"] + "/geoBoundaryBot/dta/iso_3166_1_alpha_3.csv", encoding="utf-8"
+    Path(__file__).resolve().parents[1] / "dta" / "iso_3166_1_alpha_3.csv",
+    encoding="utf-8",
 )
 
 

@@ -1,39 +1,106 @@
+import json
 import os
-import csv
 import shutil
+import stat
+import subprocess
+import tempfile
+import zipfile
+from pathlib import Path, PurePosixPath
+
 import geopandas as gpd
 from shapely.geometry import Polygon, MultiPolygon
+
+BOT_ROOT = Path(__file__).resolve().parents[1]
+VALIDATION_CHECKS = {"fileChecks", "metaChecks", "geometryDataChecks"}
+
+
+def _is_within(path, root):
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _validation_results_root():
+    raw = os.environ.get("RESULTS_DIR")
+    if not raw:
+        raise RuntimeError("RESULTS_DIR is required for pull-request validation")
+
+    root = Path(raw)
+    if not root.is_absolute():
+        raise ValueError("RESULTS_DIR must be an absolute path")
+    root = root.resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _check_output_dir(check):
+    if check not in VALIDATION_CHECKS:
+        return Path.home() / "tmp"
+
+    check_dir = _validation_results_root() / check
+    if check_dir.is_symlink():
+        raise ValueError(f"Result directory must not be a symlink: {check_dir}")
+    check_dir.mkdir(parents=True, exist_ok=True)
+    return check_dir
+
+
+def _parse_changed_files(raw):
+    try:
+        changed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("changes must be a valid JSON array") from exc
+
+    if not isinstance(changed, list) or not all(
+        isinstance(item, str) for item in changed
+    ):
+        raise ValueError("changes must be a JSON array of filenames")
+
+    validated = []
+    for item in changed:
+        if not item or "\x00" in item:
+            raise ValueError("changes contains an empty filename or NUL byte")
+        path = PurePosixPath(item)
+        if path.is_absolute() or any(part in ("", ".", "..") for part in path.parts):
+            raise ValueError(f"changes contains a non-relative filename: {item!r}")
+        validated.append(item)
+    return validated
 
 
 def initiateWorkspace(check, build=None):
     ws = {}
     if build != None:
-        try:
-            ws["working"] = os.environ["GITHUB_WORKSPACE"]
-            ws["logPath"] = (
-                os.path.expanduser("~") + "/tmp/" + str(check) + "_buildStatus.csv"
-            )
-        except:
-            ws["working"] = "/home/dan/git/geoBoundaries"
-            ws["logPath"] = (
-                os.path.expanduser("~") + "/tmp/" + str(check) + "_buildStatus.csv"
-            )
+        ws["working"] = os.environ["GITHUB_WORKSPACE"]
+        ws["logPath"] = str(Path.home() / "tmp" / f"{check}_buildStatus.csv")
 
         print("Python WD: " + ws["working"])
         print("Logging Path: " + str(ws["logPath"]))
         ws["zips"] = []
 
     else:
-        try:
-            ws["working"] = os.environ["GITHUB_WORKSPACE"]
-            ws["changedFiles"] = os.environ["changes"].strip("][").split(",")
-            ws["logPath"] = os.path.expanduser("~") + "/tmp/" + str(check) + ".txt"
-            ws["zips"] = list(filter(lambda x: x[-4:] == ".zip", ws["changedFiles"]))
-        except:
-            ws["working"] = "/home/dan/git/geoBoundaries"
-            ws["changedFiles"] = ["sourceData/PCN_ADM0.zip"]
-            ws["logPath"] = os.path.expanduser("~") + "/tmp/" + str(check) + ".txt"
-            ws["zips"] = list(filter(lambda x: x[-4:] == ".zip", ws["changedFiles"]))
+        if check not in VALIDATION_CHECKS:
+            raise ValueError(f"Unknown validation check: {check}")
+
+        working = Path(os.environ["GITHUB_WORKSPACE"])
+        if not working.is_absolute() or not working.is_dir():
+            raise ValueError("GITHUB_WORKSPACE must be an existing absolute directory")
+        working = working.resolve()
+
+        results_root = _validation_results_root()
+        if _is_within(results_root, working) or _is_within(results_root, BOT_ROOT):
+            raise ValueError(
+                "RESULTS_DIR must be outside the PR checkout and installed action"
+            )
+
+        changed_files = _parse_changed_files(os.environ["changes"])
+        check_dir = _check_output_dir(check)
+        ws["working"] = str(working)
+        ws["changedFiles"] = changed_files
+        ws["logPath"] = str(check_dir / f"{check}.txt")
+        ws["resultPath"] = str(check_dir / "RESULT.txt")
+        ws["previewPath"] = str(check_dir / "preview.png")
+        ws["zips"] = [name for name in changed_files if name.endswith(".zip")]
 
         print("Python WD: " + ws["working"])
         print("Python changedFiles: " + str(ws["changedFiles"]))
@@ -48,50 +115,134 @@ def initiateWorkspace(check, build=None):
 
 
 def logWrite(check, line):
-    # if(check != "gbAuthoritative" and check != "gbHumanitarian" and check != "gbOpen"):
     print(line)
-    with open(os.path.expanduser("~") + "/tmp/" + str(check) + ".txt", "a") as f:
+    output_dir = _check_output_dir(check)
+    with (output_dir / f"{check}.txt").open("a", encoding="utf-8") as f:
         f.write(line + "\n")
 
 
-def checkRetrieveLFSFiles(z, workingDir="./"):
-    try:
-        with open(workingDir + "/.gitattributes") as f:
-            lfsList = list(csv.reader(f, delimiter=" "))
-        # print(lfsList)
-        # print(z)
-        lfsFiles = [i[0] for i in lfsList]
-        # print(lfsFiles)
-        if z in lfsFiles:
-            print("")
-            print("--------------------------------")
-            print("Downloading LFS File (file > 25mb): " + z)
-            os.system('git lfs pull --include="' + z + '"')
+LFS_POINTER_PREFIX = b"version https://git-lfs.github.com/spec/v1"
 
-        else:
-            # print("")
-            # print("--------------------------------")
-            # print("No download from LFS required (file < 25mb): " + z)
-            # print("")
-            return 0
-    except:
-        print("Skipping LFS download; should not be needed for nightly.")
+
+def _failLFSRetrieval(relative, detail):
+    message = (
+        "I was not able to retrieve "
+        + relative.as_posix()
+        + " from Git LFS.  Submissions larger than 25mb are stored in Git LFS, and "
+        "the data behind this one was not available to the validation runner, so I "
+        "could not open it at all.  This is a problem on our side rather than "
+        "something wrong with your boundaries - please let the geoBoundaries team "
+        "know on this pull request so we can retrieve your submission manually."
+    )
+    gbEnvVars("RESULT", message, "w")
+    raise RuntimeError(f"Git LFS retrieval failed for {relative.as_posix()}: {detail}")
+
+
+def checkRetrieveLFSFiles(z, workingDir="./"):
+    working = Path(workingDir).resolve()
+    relative = PurePosixPath(z)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError(f"Invalid repository-relative LFS path: {z!r}")
+
+    print("")
+    print("--------------------------------")
+    print("Retrieving submitted file from Git LFS when applicable: " + str(relative))
+    try:
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(working),
+                "lfs",
+                "pull",
+                f"--include={relative.as_posix()}",
+                "--exclude=",
+            ],
+            check=True,
+        )
+    except (subprocess.CalledProcessError, OSError) as exc:
+        _failLFSRetrieval(relative, exc)
+
+    # A successful pull can still leave a pointer file behind when the object
+    # itself is unreachable, so confirm we have the real submission.
+    candidate = (working / relative).resolve()
+    if _is_within(candidate, working) and candidate.is_file():
+        with candidate.open("rb") as f:
+            if f.read(len(LFS_POINTER_PREFIX)) == LFS_POINTER_PREFIX:
+                _failLFSRetrieval(relative, "file is still a Git LFS pointer")
+
+
+def submissionPath(workingDir, relative_name):
+    working = Path(workingDir).resolve()
+    candidate = (working / relative_name).resolve()
+    if not _is_within(candidate, working) or not candidate.is_file():
+        raise ValueError(
+            f"Submission is not a regular file in the checkout: {relative_name!r}"
+        )
+    return candidate
 
 
 def gbEnvVars(varName, content, mode):
+    if varName != "RESULT":
+        raise ValueError(f"Unsupported validation variable: {varName}")
+    check = os.environ.get("CHECK_TYPE")
+    if check not in VALIDATION_CHECKS:
+        # Full builds retain their historical scratch-file behavior.
+        result_path = Path.home() / "tmp" / f"{varName}.txt"
+    else:
+        result_path = _check_output_dir(check) / "RESULT.txt"
+
     if mode == "w":
-        with open(os.path.expanduser("~") + "/tmp/" + varName + ".txt", "w+") as f:
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        with result_path.open("w", encoding="utf-8") as f:
             f.write(content)
         print("Set variable " + str(varName) + " to " + str(content))
     if mode == "r":
-        with open(os.path.expanduser("~") + "/tmp/" + varName + ".txt", "r") as f:
+        with result_path.open("r", encoding="utf-8") as f:
             return f.read()
+    if mode not in ("r", "w"):
+        raise ValueError(f"Unsupported mode: {mode}")
 
 
 def unzipGB(zipObj):
-    zipObj.extractall("tmp/")
-    if os.path.exists("tmp/__MACOSX"):
-        shutil.rmtree("tmp/__MACOSX")
+    runner_temp = os.environ.get("RUNNER_TEMP")
+    temp_parent = (
+        Path(runner_temp).resolve() if runner_temp else Path(tempfile.gettempdir())
+    )
+    working = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+    if (
+        not temp_parent.is_absolute()
+        or _is_within(temp_parent, working)
+        or _is_within(temp_parent, BOT_ROOT)
+    ):
+        raise ValueError(
+            "ZIP extraction directory must be outside the PR checkout and installed action"
+        )
+    temp_parent.mkdir(parents=True, exist_ok=True)
+    destination = Path(
+        tempfile.mkdtemp(prefix="geoboundary-validation-", dir=temp_parent)
+    )
+
+    for member in zipObj.infolist():
+        member_path = PurePosixPath(member.filename)
+        if (
+            member_path.is_absolute()
+            or ".." in member_path.parts
+            or "\\" in member.filename
+            or stat.S_ISLNK(member.external_attr >> 16)
+        ):
+            raise zipfile.BadZipFile(f"Unsafe ZIP member path: {member.filename!r}")
+        target = (destination / member_path.as_posix()).resolve()
+        if not _is_within(target, destination):
+            raise zipfile.BadZipFile(
+                f"ZIP member escapes extraction directory: {member.filename!r}"
+            )
+
+    zipObj.extractall(destination)
+    macos_metadata = destination / "__MACOSX"
+    if macos_metadata.exists():
+        shutil.rmtree(macos_metadata)
+    return destination
 
 
 def citationUse(releaseType):

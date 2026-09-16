@@ -25,6 +25,12 @@ rules:
   - apiGroups: [""]
     resources: ["services", "persistentvolumeclaims"]
     verbs: ["get", "list", "create", "delete"]
+  # Shared build lock (only one build runs at a time across both CronJobs)
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    # `list` is required because kr8s resolves Lease.get() as a LIST with a
+    # metadata.name field selector, not a direct GET.
+    verbs: ["get", "list", "create", "update", "patch"]
   # Create and monitor the CGAZ Job
   - apiGroups: ["batch"]
     resources: ["jobs"]

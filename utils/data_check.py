@@ -39,10 +39,10 @@ def geometryCheck(ws):
 
             # Checks begin....
             gbHelpers.logWrite(ws["checkType"], "Data Check: " + z)
-            bZip = zipfile.ZipFile(ws["working"] + "/" + z)
+            bZip = zipfile.ZipFile(gbHelpers.submissionPath(ws["working"], z))
 
             # Extract the zipfiles contents
-            gbHelpers.unzipGB(bZip)
+            extraction_dir = gbHelpers.unzipGB(bZip)
 
             geojson = list(filter(lambda x: x[-8:] == ".geojson", bZip.namelist()))
             shp = list(filter(lambda x: x[-4:] == ".shp", bZip.namelist()))
@@ -56,7 +56,7 @@ def geometryCheck(ws):
                         ws["checkType"], "Shapefile (*.shp) found. Attempting to load."
                     )
                     try:
-                        dta = geopandas.read_file("tmp/" + shp[0])
+                        dta = geopandas.read_file(extraction_dir / shp[0])
                     except Exception as e:
                         gbHelpers.logWrite(
                             ws["checkType"],
@@ -81,7 +81,7 @@ def geometryCheck(ws):
                         "geoJSON (*.geojson) found. Attempting to load.",
                     )
                     try:
-                        dta = geopandas.read_file("tmp/" + geojson[0])
+                        dta = geopandas.read_file(extraction_dir / geojson[0])
                     except:
                         gbHelpers.logWrite(
                             ws["checkType"],
@@ -193,7 +193,10 @@ def geometryCheck(ws):
                 ):
                     try:
                         dta.boundary.plot()
-                        plt.savefig(os.path.expanduser("~") + "/tmp/preview.png")
+                        preview_path = ws.get(
+                            "previewPath", os.path.expanduser("~/tmp/preview.png")
+                        )
+                        plt.savefig(preview_path)
                     except:
                         gbHelpers.logWrite(
                             ws["checkType"],

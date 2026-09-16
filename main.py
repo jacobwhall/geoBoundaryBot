@@ -80,7 +80,7 @@ def main(build_type, build_ver, countries, type_query, api_key):
             ws["zipSuccess"] = 0
 
             ws["zips"] = []
-            ws["zips"].append("/sourceData/" + buildType + "/" + filename)
+            ws["zips"].append("sourceData/" + buildType + "/" + filename)
 
             try:
                 with zipfile.ZipFile(ws["working"] + "/" + ws["zips"][0]) as zF:

@@ -8,7 +8,9 @@ from . import helpers as gbHelpers
 
 def metaCheck(ws):
     # Load ISOs for later checks
-    with open(ws["working"] + "/geoBoundaryBot/dta/iso_3166_1_alpha_3.csv") as isoCsv:
+    with (gbHelpers.BOT_ROOT / "dta" / "iso_3166_1_alpha_3.csv").open(
+        encoding="utf-8"
+    ) as isoCsv:
         lines = isoCsv.readlines()
 
     validISO = []
@@ -19,7 +21,7 @@ def metaCheck(ws):
     print(validISO)
 
     # Load licenses for later checks
-    with open(ws["working"] + "/geoBoundaryBot/dta/gbLicenses.csv") as lCsv:
+    with (gbHelpers.BOT_ROOT / "dta" / "gbLicenses.csv").open(encoding="utf-8") as lCsv:
         lines = lCsv.readlines()
 
     validLicense = []
@@ -67,7 +69,7 @@ def metaCheck(ws):
 
             gbHelpers.logWrite(ws["checkType"], "Metadata Check: " + z)
             try:
-                bZip = zipfile.ZipFile(ws["working"] + "/" + z)
+                bZip = zipfile.ZipFile(gbHelpers.submissionPath(ws["working"], z))
             except:
                 print("A zipfile didn't open.  " + str(z))
                 return [opt, req, 0]
@@ -76,7 +78,7 @@ def metaCheck(ws):
                 gbHelpers.logWrite(ws["checkType"], "============================")
                 gbHelpers.logWrite(ws["checkType"], "Metadata file exists in " + z)
 
-                with zipfile.ZipFile(ws["working"] + "/" + z) as zF:
+                with zipfile.ZipFile(gbHelpers.submissionPath(ws["working"], z)) as zF:
                     meta = zF.read("meta.txt")
 
                 for m in meta.splitlines():
@@ -280,7 +282,7 @@ def metaCheck(ws):
                                 licPic = 0
                                 try:
                                     with zipfile.ZipFile(
-                                        ws["working"] + "/" + z
+                                        gbHelpers.submissionPath(ws["working"], z)
                                     ) as zFb:
                                         licPic = zFb.read("license.png")
                                 except:
@@ -288,7 +290,7 @@ def metaCheck(ws):
 
                                 try:
                                     with zipfile.ZipFile(
-                                        ws["working"] + "/" + z
+                                        gbHelpers.submissionPath(ws["working"], z)
                                     ) as zFb:
                                         licPic = zFb.read("license.jpg")
                                 except:

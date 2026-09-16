@@ -3,13 +3,20 @@ image:
   tag: latest
   pullPolicy: Always
 
-# Nightly build CronJob
+# Build pipeline. Two CronJobs are produced from `build.nightly` and
+# `build.release` — both run the same image and code path, differentiated
+# only by env vars (GB_RELEASE_VERSION, GB_STRICT, GB_PROMOTE_CURRENT).
+#
+# Only one build may run at a time: both CronJobs share the Dask cluster,
+# the data PVC and the ephemeral PostGIS, so the driver holds a Kubernetes
+# Lease (<release>-build-lock) for the whole run. `lockWaitSeconds` controls
+# what a build does if the lock is already held: 0 = exit 1 immediately,
+# N = wait up to N seconds for the other build to finish.
+#
+# Trigger a release manually:
+#   helm upgrade ... --reuse-values --set build.release.version=v7
+#   kubectl create job --from=cronjob/<release>-build-release <job-name>
 build:
-  schedule: "0 2 * * *"
-  # strict=true makes any boundary-build failure fail the whole pipeline
-  # (skip CGAZ, exit 1). Leave false for nightly runs so upstream data issues
-  # are surfaced but don't fail the Job. Set true for release runs.
-  strict: false
   sync:
     dataRepo: https://github.com/wmgeolab/geoBoundaries.git
     branch: main
@@ -23,6 +30,27 @@ build:
     limits:
       memory: 4Gi
       cpu: "2"
+
+  nightly:
+    schedule: "0 2 * * *"
+    suspend: false
+    version: nightly
+    strict: false
+    promoteCurrent: false
+    # Fail fast if a release build is running; the next nightly picks it up.
+    lockWaitSeconds: 0
+
+  release:
+    # Suspended — never fires on its own. Trigger manually with
+    #   kubectl create job --from=cronjob/<release>-build-release ...
+    schedule: "0 5 31 2 *" # placeholder; suspended
+    suspend: true
+    version: v6 # override per release via --set build.release.version=v7
+    strict: true
+    promoteCurrent: true
+    # Wait for an in-flight nightly to finish (up to 6h) rather than fail
+    # the manually triggered release.
+    lockWaitSeconds: 21600
 
 # Persistent volume for the geoBoundaries data repo
 volume:
@@ -73,16 +101,16 @@ dask:
   jupyter:
     enabled: false
 
-# S3-compatible storage for build outputs (e.g. Cloudflare R2)
+# S3-compatible storage for build outputs (e.g. Cloudflare R2).
 # Disabled by default. Create the credentials secret before enabling:
 #   kubectl create secret generic gb-s3-credentials \
 #     --from-literal=access-key-id=<key> \
 #     --from-literal=secret-access-key=<secret>
+# Objects are uploaded under <GB_RELEASE_VERSION>/<product>/<ISO>/<ADM>/...
 s3:
   enabled: false
   endpoint: "" # e.g. https://<account>.r2.cloudflarestorage.com
   bucket: ""
-  keyPrefix: "" # optional prefix prepended to all keys
   credentialsSecret: gb-s3-credentials
 
 # Ephemeral PostGIS for passing build outputs to the CGAZ job

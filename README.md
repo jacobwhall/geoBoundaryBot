@@ -45,7 +45,9 @@ Key values:
 
 | Value | Default | Description |
 |---|---|---|
-| `build.schedule` | `"0 2 * * *"` | CronJob schedule (nightly at 2 AM UTC) |
+| `build.nightly.schedule` | `"0 2 * * *"` | Nightly CronJob schedule (2 AM UTC) |
+| `build.release.version` | `v6` | Version prefix for release builds (override per release) |
+| `build.<nightly\|release>.lockWaitSeconds` | `0` / `21600` | How long to wait for the shared build lock (0 = fail fast) |
 | `build.dask.workers` | `4` | Number of Dask workers during builds |
 | `build.sync.dataRepo` | `wmgeolab/geoBoundaries` | Git URL for the data repo |
 | `volume.storageClass` | `""` | Storage class for the data PVC |
@@ -55,7 +57,6 @@ Key values:
 | `s3.enabled` | `false` | Enable S3 uploads from workers |
 | `s3.endpoint` | `""` | S3-compatible endpoint URL |
 | `s3.bucket` | `""` | Bucket name |
-| `s3.keyPrefix` | `""` | Optional prefix prepended to all S3 keys |
 | `s3.credentialsSecret` | `gb-s3-credentials` | Secret name for S3 credentials |
 | `cloudflared.replicas` | `2` | Cloudflare Tunnel replica count |
 | `cloudflared.tokenSecret` | `cloudflared-token` | Secret name for the tunnel token |
@@ -114,10 +115,16 @@ When `s3.enabled` is `false` (the default), no S3 env vars are injected and uplo
 
 ### Manual builds
 
-To trigger a build outside the nightly schedule:
+The chart renders two CronJobs, `gb-build-nightly` (scheduled) and
+`gb-build-release` (suspended, manual only). To trigger a build by hand:
 
 ```sh
-kubectl create job --from=cronjob/gb-build gb-build-manual
+# extra nightly run
+kubectl create job --from=cronjob/gb-build-nightly gb-build-manual
+
+# release: set the version first, then create the job
+helm upgrade gb charts/geoboundarybot/ --reuse-values --set build.release.version=v7
+kubectl create job --from=cronjob/gb-build-release gb-build-v7
 ```
 
 Follow the logs:
@@ -132,15 +139,36 @@ Clean up when done:
 kubectl delete job gb-build-manual
 ```
 
+### Build lock
+
+Only one build can run at a time. Both CronJobs share the Dask cluster, the
+data PVC and the ephemeral PostGIS, and `concurrencyPolicy: Forbid` only
+prevents overlap within a single CronJob. So the driver holds a Kubernetes
+Lease named `gb-build-lock` for the whole run, renewed every minute.
+
+- A nightly that finds the lock held exits 1 immediately (`lockWaitSeconds: 0`); the next nightly picks it up.
+- A release that finds the lock held waits for the running build to finish, up to `build.release.lockWaitSeconds` (default 6h).
+- A driver that crashes stops renewing; the lease is treated as free after 5 minutes.
+
+Inspect or force-clear the lock:
+
+```sh
+kubectl get lease gb-build-lock -o yaml
+kubectl delete lease gb-build-lock   # only if no build pod is actually running
+```
+
 ### Build pipeline overview
 
 The CronJob runs `python -m builder.run`, which orchestrates:
 
+0. **Lock** -- acquires the shared build Lease (see above)
 1. **Sync** -- pulls the latest geoBoundaries data repo onto the PVC
 2. **PostGIS** -- creates an ephemeral PostGIS Deployment, Service, and PVC via kr8s
 3. **Scale up** -- scales Dask workers from 0 to the configured count
 4. **Build** -- discovers boundary ZIPs and fans out builds across Dask workers; each worker pushes its output geometries to PostGIS and uploads files to S3 (if configured)
 5. **Scale down** -- scales Dask workers back to 0 (runs even on failure)
 6. **CGAZ** -- launches a one-shot Kubernetes Job that reads boundaries from PostGIS
-7. **Teardown** -- deletes the ephemeral PostGIS resources
-8. **Exit** -- exits 0 on success, 1 on any failure (marks the CronJob as failed)
+7. **Verify** -- on release runs, checks every uploaded object exists in the bucket
+8. **Promote** -- on release runs, writes `current.json` pointing at the new version
+9. **Teardown** -- deletes the ephemeral PostGIS resources and releases the build lock
+10. **Exit** -- exits 0 on success, 1 on any failure (marks the CronJob as failed)

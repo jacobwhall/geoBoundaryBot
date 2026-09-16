@@ -5,40 +5,68 @@ inputs:
   check-type:
     description: 'Type of check to run: zip, meta, or data'
     required: true
+  results-dir:
+    description: 'Absolute directory outside the PR checkout for validation results'
+    required: true
+  changes:
+    description: 'JSON array of repository-relative paths changed by the PR'
+    required: true
 
 runs:
   using: 'composite'
   steps:
-    - name: Link bot repo for dta/ path compatibility
-      shell: bash
-      run: ln -sfn "${{ github.action_path }}/../.." "$GITHUB_WORKSPACE/geoBoundaryBot"
-
-    - name: Create working directories
-      shell: bash
-      run: mkdir -p ~/tmp tmp
-
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      with:
+        version: '0.12.15'
+        enable-cache: false
 
-    - name: Install dependencies
+    - name: Install trusted validator dependencies
       shell: bash
       working-directory: ${{ github.action_path }}/../..
-      run: uv sync --locked
+      run: uv sync --locked --no-dev
 
     - name: Run check
       shell: bash
+      working-directory: ${{ github.action_path }}/../..
       env:
+        changes: ${{ inputs.changes }}
+        CHECK_KIND: ${{ inputs.check-type }}
         PYTHONPATH: ${{ github.action_path }}/../..
+        RESULTS_DIR: ${{ inputs.results-dir }}
       run: |
-        case "${{ inputs.check-type }}" in
-          zip)  uv --project "${{ github.action_path }}/../.." run python -m utils.zip_check ;;
-          meta) uv --project "${{ github.action_path }}/../.." run python -m utils.meta_check ;;
-          data) uv --project "${{ github.action_path }}/../.." run python -m utils.data_check ;;
-          *)    echo "::error::Unknown check-type: ${{ inputs.check-type }}"; exit 1 ;;
+        case "$CHECK_KIND" in
+          zip)
+            export CHECK_TYPE=fileChecks
+            uv run --no-sync python -m utils.zip_check
+            ;;
+          meta)
+            export CHECK_TYPE=metaChecks
+            uv run --no-sync python -m utils.meta_check
+            ;;
+          data)
+            export CHECK_TYPE=geometryDataChecks
+            uv run --no-sync python -m utils.data_check
+            ;;
+          *)
+            echo "::error::Unknown check-type: $CHECK_KIND"
+            exit 1
+            ;;
         esac
 
     - name: Evaluate check result
+      if: ${{ always() }}
       shell: bash
+      working-directory: ${{ github.action_path }}/../..
       env:
+        CHECK_KIND: ${{ inputs.check-type }}
         PYTHONPATH: ${{ github.action_path }}/../..
-      run: uv --project "${{ github.action_path }}/../.." run python -m utils.check_fail
+        RESULTS_DIR: ${{ inputs.results-dir }}
+      run: |
+        case "$CHECK_KIND" in
+          zip)  export CHECK_TYPE=fileChecks ;;
+          meta) export CHECK_TYPE=metaChecks ;;
+          data) export CHECK_TYPE=geometryDataChecks ;;
+          *) exit 1 ;;
+        esac
+        uv run --no-sync python -m utils.check_fail

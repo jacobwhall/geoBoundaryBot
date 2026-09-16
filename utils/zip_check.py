@@ -26,7 +26,7 @@ if len(ws["zips"]) > 0:
             checkType,
             "File Check (" + str(zipTotal) + " of " + str(len(ws["zips"])) + "): " + z,
         )
-        bZip = zipfile.ZipFile(ws["working"] + "/" + z)
+        bZip = zipfile.ZipFile(gbHelpers.submissionPath(ws["working"], z))
 
         if "meta.txt" in bZip.namelist():
             gbHelpers.logWrite(checkType, "Metadata file exists in " + z)
