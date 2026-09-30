@@ -2,10 +2,10 @@
  * geoBoundaries API Worker
  *
  * Serves /api/{version}/{product}/{ISO|ALL}/{ADM|ALL}/ on
- * www.geoboundaries.org. Concrete boundary requests read one metadata JSON
+ * www.geoboundaries-dev.org. Concrete boundary requests read one metadata JSON
  * from R2. Requests containing ALL read a prebuilt product index and return
  * the matching records. Download URLs are rewritten to point at the public
- * R2 custom domain (data.geoboundaries.org).
+ * R2 custom domain (data.geoboundaries-dev.org).
  *
  * `current` is resolved at request time by reading /current.json from
  * the bucket root, which the build pipeline writes during a promoted
@@ -203,8 +203,9 @@ async function resolveCurrent(env: Env, ctx: ExecutionContext): Promise<string |
 
 /**
  * Replace the host portion of every URL field with our R2 custom domain.
- * The build pipeline embeds GitHub raw URLs at build time; we strip the
- * existing prefix and re-anchor at data.geoboundaries.org/{version}/...
+ * The build pipeline writes bare file names (older records carry GitHub raw
+ * URLs); we keep only the file name and re-anchor it at
+ * data.geoboundaries-dev.org/{version}/...
  *
  * Mutates `meta` in place.
  */

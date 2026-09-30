@@ -111,6 +111,39 @@ describe("Worker responses", () => {
     await Promise.all(ctx.pending);
   });
 
+  test("anchors the builder's bare download file names at the data domain", async () => {
+    const env = environment({
+      "nightly/gbOpen/KEN/ADM1/geoBoundaries-KEN-ADM1-metaData.json": {
+        boundaryISO: "KEN",
+        boundaryType: "ADM1",
+        staticDownloadLink: "geoBoundaries-KEN-ADM1-all.zip",
+        gjDownloadURL: "geoBoundaries-KEN-ADM1.geojson",
+        tjDownloadURL: "geoBoundaries-KEN-ADM1.topojson",
+        imagePreview: "geoBoundaries-KEN-ADM1-PREVIEW.png",
+        simplifiedGeometryGeoJSON: "geoBoundaries-KEN-ADM1_simplified.geojson",
+      },
+    });
+    const ctx = executionContext();
+    const response = await worker.fetch(
+      new Request("https://www.geoboundaries.test/api/nightly/gbOpen/KEN/ADM1/"),
+      env,
+      ctx,
+    );
+    const body = await response.json();
+
+    const base = "https://data.geoboundaries.test/nightly/gbOpen/KEN/ADM1";
+    assert.equal(response.status, 200);
+    assert.equal(body.staticDownloadLink, `${base}/geoBoundaries-KEN-ADM1-all.zip`);
+    assert.equal(body.gjDownloadURL, `${base}/geoBoundaries-KEN-ADM1.geojson`);
+    assert.equal(body.tjDownloadURL, `${base}/geoBoundaries-KEN-ADM1.topojson`);
+    assert.equal(body.imagePreview, `${base}/geoBoundaries-KEN-ADM1-PREVIEW.png`);
+    assert.equal(
+      body.simplifiedGeometryGeoJSON,
+      `${base}/geoBoundaries-KEN-ADM1_simplified.geojson`,
+    );
+    await Promise.all(ctx.pending);
+  });
+
   for (const [selectors, expected] of [
     ["USA/ALL", ["USA/ADM0", "USA/ADM1"]],
     ["ALL/ADM0", ["CAN/ADM0", "USA/ADM0"]],

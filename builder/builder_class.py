@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import time
 import zipfile
+from functools import lru_cache
 
 import geopandas as gpd
 from pathlib import Path
@@ -17,7 +18,46 @@ from shapely.geometry.multipolygon import MultiPolygon
 from shapely.geometry.polygon import Polygon
 from shapely.validation import explain_validity
 
-from builder.paths import SOURCE_DATA, RELEASE_DATA, TMP_DIR
+from builder.paths import ISO_CSV, SOURCE_DATA, RELEASE_DATA, TMP_DIR
+
+# Country-level fields copied from the ISO table onto every metadata record,
+# as the legacy API did. Each is also the column name in ISO_CSV.
+COUNTRY_FIELDS = (
+    "Continent",
+    "UNSDG-region",
+    "UNSDG-subregion",
+    "worldBankIncomeGroup",
+)
+
+
+def parse_meta_line(line):
+    """Split a meta.txt line into (key, value) at the first colon only, so
+    values that contain colons (URLs, times) come through intact."""
+    key, sep, val = line.partition(":")
+    if not sep:
+        raise ValueError("no ':' separator")
+    return key.strip(), val.strip()
+
+
+@lru_cache(maxsize=1)
+def _country_table():
+    # dtype=str + keep_default_na=False keep blank cells as "" rather than
+    # NaN, which json.dump would write as invalid JSON.
+    return pd.read_csv(ISO_CSV, dtype=str, keep_default_na=False).set_index(
+        "Alpha-3code"
+    )
+
+
+def country_details(iso):
+    """The country name and COUNTRY_FIELDS for an ISO code ("" if unknown)."""
+    table = _country_table()
+    if iso not in table.index:
+        return {"boundaryName": "", **{field: "" for field in COUNTRY_FIELDS}}
+    row = table.loc[iso]
+    return {
+        "boundaryName": row["Name"],
+        **{field: row[field] for field in COUNTRY_FIELDS},
+    }
 
 
 class builder:
@@ -195,11 +235,7 @@ class builder:
 
         for m in self.metaData.splitlines():
             try:
-                e = m.split(":")
-                if len(e) > 2:
-                    e[1] = e[1] + e[2]
-                key = e[0].strip()
-                val = e[1].strip()
+                key, val = parse_meta_line(m)
             except Exception as e:
                 self.logger.warning(
                     "At least one line of meta.txt failed to be read correctly: "
@@ -453,7 +489,12 @@ class builder:
             self.metaDataLib["boundaryID"] = str(
                 str(self.ISO) + "-" + str(self.ADM) + "-" + str(self.metaHash)
             )
+            country = country_details(self.ISO)
+            self.metaDataLib["boundaryName"] = country["boundaryName"]
             self.metaDataLib["boundaryISO"] = self.ISO
+            # boundaryYearRepresented is the legacy API name; boundaryYear is
+            # kept for anything already reading the newer name.
+            self.metaDataLib["boundaryYearRepresented"] = self.metaReq["year"]
             self.metaDataLib["boundaryYear"] = self.metaReq["year"]
             self.metaDataLib["boundaryType"] = self.metaReq["bType"]
             self.metaDataLib["boundarySource"] = self.metaReq["source"]
@@ -507,6 +548,8 @@ class builder:
                 return "ERROR: The source data date was unable to be calculated during build."
 
             self.metaDataLib["buildDate"] = time.strftime("%b %d, %Y")
+            for field in COUNTRY_FIELDS:
+                self.metaDataLib[field] = country[field]
             return "Metadata checks successful, metadata built in self.metaDataLib."
 
         else:
@@ -1096,6 +1139,14 @@ class builder:
 
         tmpFold.mkdir(parents=True, exist_ok=True)
         self.targetPath.mkdir(parents=True, exist_ok=True)
+
+        # Download links, as file names relative to the metadata file. The API
+        # Worker re-anchors them at the data domain for the requested version.
+        self.metaDataLib["staticDownloadLink"] = fullZip.name
+        self.metaDataLib["gjDownloadURL"] = jsonOUT.name
+        self.metaDataLib["tjDownloadURL"] = topoOUT.name
+        self.metaDataLib["imagePreview"] = imgOUT.name
+        self.metaDataLib["simplifiedGeometryGeoJSON"] = jsonOUT_simp.name
 
         # Write the metadata file out
         self.logger.info("Writing metadata files.")

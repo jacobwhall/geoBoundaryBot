@@ -175,13 +175,11 @@ def main(build_type, build_ver, countries, type_query, api_key):
             row["boundaryType"] = "METADATA ERROR"
 
             for m in meta.splitlines():
-                e = m.decode("utf-8").split(":")
-                if len(e) > 2:
-                    e[1] = e[1] + e[2]
-                key = e[0].strip()
-                try:
-                    val = e[1].strip()
-                except:
+                # Split at the first colon only, so URLs keep theirs.
+                key, sep, val = m.decode("utf-8").partition(":")
+                key = key.strip()
+                val = val.strip()
+                if not sep:
                     if buildVer == "nightly":
                         row["status"] = "FAIL"
                     else:

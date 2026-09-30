@@ -84,11 +84,12 @@ def metaCheck(ws):
                 for m in meta.splitlines():
                     try:
                         gbHelpers.logWrite(ws["checkType"], "")
-                        e = m.decode("utf-8").split(":")
-                        if len(e) > 2:
-                            e[1] = e[1] + e[2]
-                        key = e[0].strip()
-                        val = e[1].strip()
+                        # Split at the first colon only, so URLs keep theirs.
+                        key, sep, val = m.decode("utf-8").partition(":")
+                        if not sep:
+                            raise ValueError("no ':' separator")
+                        key = key.strip()
+                        val = val.strip()
                     except:
                         checkFail = 1
                         gbHelpers.logWrite(
