@@ -629,7 +629,13 @@ def _s3_client(s3_config):
         endpoint_url=s3_config["endpoint"],
         aws_access_key_id=s3_config["access_key_id"],
         aws_secret_access_key=s3_config["secret_access_key"],
-        config=BotoConfig(retries={"max_attempts": 5, "mode": "standard"}),
+        # R2 only accepts SigV4. Requests default to it anyway, but presigned
+        # URLs fall back to legacy SigV2 unless it's set explicitly.
+        region_name="auto",
+        config=BotoConfig(
+            signature_version="s3v4",
+            retries={"max_attempts": 5, "mode": "standard"},
+        ),
     )
 
 
