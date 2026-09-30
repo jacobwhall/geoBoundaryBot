@@ -603,7 +603,11 @@ def scale_dask_workers(replicas, timeout=300):
 
 
 def discover_boundaries(products=None):
-    """Scan sourceData/ for ZIP files and return (product, iso, adm) tuples."""
+    """Scan sourceData/ for ZIP files.
+
+    Returns (product, iso, adm, size) tuples, where size is the ZIP's size
+    in bytes.
+    """
 
     products = products or PRODUCTS
     boundaries = []
@@ -615,7 +619,9 @@ def discover_boundaries(products=None):
         for zip_file in sorted(source_dir.glob("*.zip")):
             parts = zip_file.stem.split("_", 1)
             if len(parts) == 2:
-                boundaries.append((product, parts[0], parts[1]))
+                boundaries.append(
+                    (product, parts[0], parts[1], zip_file.stat().st_size)
+                )
             else:
                 log.warning("Skipping malformed filename: %s", zip_file.name)
     return boundaries
@@ -843,8 +849,8 @@ def run_boundary_builds(scheduler_url, db_url, s3_config=None, version="nightly"
         log.info("Nothing to build.")
         return [], []
 
-    # Deeper ADM levels take longest, so start them first to shorten the
-    # tail.  Dask runs higher-priority tasks first.
+    # Bigger source files take longest to build, so start them first to
+    # shorten the tail.  Dask runs higher-priority tasks first.
     futures = {
         client.submit(
             build_boundary,
@@ -854,9 +860,9 @@ def run_boundary_builds(scheduler_url, db_url, s3_config=None, version="nightly"
             db_url,
             s3_config=s3_config,
             key=f"{version}-{product}-{iso}-{adm}",
-            priority=_adm_priority(adm),
+            priority=size,
         ): (product, iso, adm)
-        for product, iso, adm in boundaries
+        for product, iso, adm, size in boundaries
     }
 
     successes = []
@@ -893,13 +899,6 @@ def _adm_sort_key(adm):
     if isinstance(adm, str) and adm.startswith("ADM") and adm[3:].isdigit():
         return int(adm[3:])
     return sys.maxsize
-
-
-def _adm_priority(adm):
-    """Dask priority for a boundary build: its ADM level, 0 if malformed."""
-
-    level = _adm_sort_key(adm)
-    return 0 if level == sys.maxsize else level
 
 
 def upload_api_indexes(successes, s3_config):
