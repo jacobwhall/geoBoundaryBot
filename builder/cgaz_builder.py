@@ -10,6 +10,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import geopandas as gpd
 import pandas as pd
+import requests
 
 from builder.paths import RELEASE_DATA, TMP_DIR, ISO_CSV, LSIB_GEOJSON
 
@@ -37,6 +38,19 @@ def cmd(command, **kwargs):
         if r.stderr.strip():
             logger.error("stderr: %s", r.stderr.strip())
     return r
+
+
+def fetch_lsib(url):
+    """Download the LSIB file the build driver staged, and return its path."""
+    dest = TMP_DIR / LSIB_GEOJSON.name
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    logger.info("Downloading LSIB base layer to %s", dest)
+    with requests.get(url, stream=True, timeout=60) as resp:
+        resp.raise_for_status()
+        with open(dest, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=1 << 20):
+                f.write(chunk)
+    return str(dest)
 
 
 def preprocess_dta():
@@ -612,6 +626,10 @@ if __name__ == "__main__":
 
     try:
         logger.info("Starting CGAZ boundary processing...")
+        # In the image dta/ only holds the LFS pointer, so the driver passes
+        # a URL for the real file. Without one, use dta/ as-is (local runs).
+        if os.environ.get("GB_LSIB_URL"):
+            stdGeom = fetch_lsib(os.environ["GB_LSIB_URL"])
         preprocess_dta()
         adm0str, adm1str, adm2str = process_geometries(args)
         join_admins(adm0str, adm1str, adm2str)

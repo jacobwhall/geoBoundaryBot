@@ -5,7 +5,8 @@ Entrypoint: `python -m builder.run`
 Orchestrates the full build:
   0. Acquire the shared build lock (a Kubernetes Lease) so the nightly and
      release CronJobs can never run concurrently
-  1. Pull latest changes from the data repo
+  1. Pull latest changes from the data repo, and make sure the LSIB base
+     layer CGAZ needs is cached in the bucket (copied from Git LFS if not)
   2. Create an ephemeral PostGIS database for build outputs
   3. Scale up Dask workers
   4. Discover boundaries and fan out builds across Dask
@@ -22,10 +23,12 @@ Orchestrates the full build:
   Exit 0 on success, 1 on failure
 """
 
+import hashlib
 import json
 import mimetypes
 import boto3
 from botocore.config import Config as BotoConfig
+from botocore.exceptions import ClientError
 import logging
 import os
 import shutil
@@ -44,9 +47,10 @@ from builder.paths import SOURCE_DATA
 from builder.paths import RELEASE_DATA, TMP_DIR
 from sqlalchemy import create_engine, text
 from builder.builder_class import builder
-from builder.paths import ISO_CSV, LICENSES_CSV, RELEASE_DATA
+from builder.paths import ISO_CSV, LICENSES_CSV, LSIB_GEOJSON, RELEASE_DATA
 import geopandas as gpd
 import pandas as pd
+import requests
 from sqlalchemy import create_engine
 from dask.distributed import Client, as_completed
 from kr8s.objects import Job
@@ -1072,11 +1076,129 @@ def log_failure_summary(failures, strict):
 
 
 # ---------------------------------------------------------------------------
+# LSIB base layer for CGAZ
+# ---------------------------------------------------------------------------
+
+# The image only carries the Git LFS pointer for the ~400 MB LSIB file. The
+# object itself is cached in the bucket, outside any release prefix, and
+# copied there from LFS the first time a build finds it missing.
+LSIB_KEY = f"reference/lsib/{LSIB_GEOJSON.name}"
+LSIB_LFS_REPO = os.environ.get(
+    "GB_LSIB_LFS_REPO", "https://github.com/wmgeolab/geoBoundaryBot.git"
+)
+
+
+def _read_lfs_pointer(path):
+    """Return (sha256, size) from the Git LFS pointer file at `path`."""
+
+    # A real pointer is ~130 bytes; anything bigger means LFS was smudged
+    # into the image and there's no pointer to read.
+    if path.stat().st_size > 1024:
+        raise ValueError(f"{path} is not a Git LFS pointer")
+    fields = dict(
+        line.split(" ", 1) for line in path.read_text().splitlines() if " " in line
+    )
+    oid = fields.get("oid", "")
+    if not oid.startswith("sha256:") or "size" not in fields:
+        raise ValueError(f"{path} is not a Git LFS pointer")
+    return oid.removeprefix("sha256:"), int(fields["size"])
+
+
+def _lfs_download_url(oid, size):
+    """Ask the LFS server for a short-lived download URL for one object."""
+
+    resp = requests.post(
+        f"{LSIB_LFS_REPO.removesuffix('/')}/info/lfs/objects/batch",
+        data=json.dumps({
+            "operation": "download",
+            "transfers": ["basic"],
+            "objects": [{"oid": oid, "size": size}],
+        }),
+        headers={
+            "Accept": "application/vnd.git-lfs+json",
+            "Content-Type": "application/vnd.git-lfs+json",
+        },
+        timeout=60,
+    )
+    resp.raise_for_status()
+    obj = resp.json()["objects"][0]
+    if "error" in obj:
+        raise RuntimeError(f"LFS server refused object {oid}: {obj['error']}")
+    return obj["actions"]["download"]["href"]
+
+
+def stage_lsib(s3_config):
+    """Make sure the LSIB file is in the bucket, copying it from LFS if not.
+
+    The bucket copy is tagged with the pointer's sha256, so updating the
+    pointer in dta/ replaces it on the next run.
+    """
+
+    oid, size = _read_lfs_pointer(LSIB_GEOJSON)
+    s3 = _s3_client(s3_config)
+    bucket = s3_config["bucket"]
+
+    try:
+        head = s3.head_object(Bucket=bucket, Key=LSIB_KEY)
+    except ClientError as e:
+        if e.response["Error"]["Code"] not in ("404", "NoSuchKey", "NotFound"):
+            raise
+    else:
+        if head.get("Metadata", {}).get("sha256") == oid:
+            log.info("LSIB already cached at s3://%s/%s", bucket, LSIB_KEY)
+            return
+        log.warning(
+            "s3://%s/%s doesn't match the LFS pointer, replacing it", bucket, LSIB_KEY
+        )
+
+    log.info(
+        "Copying LSIB (%d bytes) from %s to s3://%s/%s",
+        size, LSIB_LFS_REPO, bucket, LSIB_KEY,
+    )
+    digest = hashlib.sha256()
+    with tempfile.NamedTemporaryFile(suffix=".geojson") as tmp:
+        with requests.get(_lfs_download_url(oid, size), stream=True, timeout=60) as resp:
+            resp.raise_for_status()
+            for chunk in resp.iter_content(chunk_size=1 << 20):
+                tmp.write(chunk)
+                digest.update(chunk)
+        tmp.flush()
+        if digest.hexdigest() != oid:
+            raise RuntimeError(
+                f"LSIB download has sha256 {digest.hexdigest()}, expected {oid}"
+            )
+        s3.upload_file(
+            tmp.name,
+            bucket,
+            LSIB_KEY,
+            ExtraArgs={"ContentType": "application/geo+json", "Metadata": {"sha256": oid}},
+        )
+    log.info("Cached LSIB at s3://%s/%s", bucket, LSIB_KEY)
+
+
+def lsib_url(s3_config, expires=7200):
+    """A URL the CGAZ pod can download the LSIB file from without credentials.
+
+    `expires` matches run_cgaz_job's timeout, so the URL stays valid for
+    the Job's retry pod too.
+    """
+
+    if s3_config is None:
+        # No bucket to cache in, so hand CGAZ the (one-hour) LFS URL directly.
+        return _lfs_download_url(*_read_lfs_pointer(LSIB_GEOJSON))
+    return _s3_client(s3_config).generate_presigned_url(
+        "get_object",
+        Params={"Bucket": s3_config["bucket"], "Key": LSIB_KEY},
+        ExpiresIn=expires,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Step 6 — CGAZ Job via kr8s
 # ---------------------------------------------------------------------------
 
 
-def run_cgaz_job(db_url, timeout=7200):
+def run_cgaz_job(db_url, lsib_url, timeout=7200):
     """Create a one-shot Kubernetes Job for CGAZ processing and wait for it."""
 
     release = os.environ["GB_RELEASE_NAME"]
@@ -1119,6 +1241,10 @@ def run_cgaz_job(db_url, timeout=7200):
                                 {
                                     "name": "DATABASE_URL",
                                     "value": db_url,
+                                },
+                                {
+                                    "name": "GB_LSIB_URL",
+                                    "value": lsib_url,
                                 },
                             ],
                             "volumeMounts": [
@@ -1247,6 +1373,11 @@ def _run_pipeline(version, strict, promote, dask_workers, scheduler, s3_config):
     log.info("=== Step 1: Syncing data repository ===")
     sync_data_repo()
 
+    # Before the long build, so a missing LSIB fails the run early.
+    if s3_config:
+        log.info("Staging LSIB base layer for CGAZ")
+        stage_lsib(s3_config)
+
     # 2. Create ephemeral build database
     log.info("=== Step 2: Creating build database ===")
     db_url = create_build_db()
@@ -1285,7 +1416,7 @@ def _run_pipeline(version, strict, promote, dask_workers, scheduler, s3_config):
 
         # 7. CGAZ
         log.info("=== Step 7: Running CGAZ job ===")
-        cgaz_ok = run_cgaz_job(db_url)
+        cgaz_ok = run_cgaz_job(db_url, lsib_url(s3_config))
         if not cgaz_ok:
             log.error("CGAZ job failed")
             sys.exit(1)
