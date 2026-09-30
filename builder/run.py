@@ -71,7 +71,9 @@ def _utcnow():
 
 
 def _k8s_time(dt):
-    return dt.isoformat().replace("+00:00", "Z")
+    # Lease acquireTime/renewTime are MicroTime, which the API server only
+    # accepts with exactly six fractional digits.
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def _status_code(exc):
