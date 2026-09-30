@@ -695,6 +695,26 @@ def upload_to_s3(output_dir, key_prefix, s3_config):
     return manifest
 
 
+class _StageTimer:
+    """Wall-clock seconds spent in each build stage, in the order they ran."""
+
+    def __init__(self):
+        self.timings = {}
+        self._stage = None
+        self._t0 = self._start = time.perf_counter()
+
+    def start(self, stage):
+        """Close out the running stage, if any, and start timing `stage`."""
+        now = time.perf_counter()
+        if self._stage is not None:
+            self.timings[self._stage] = round(now - self._start, 1)
+        self._stage, self._start = stage, now
+
+    def stop(self):
+        self.start(None)
+        self.timings["total"] = round(time.perf_counter() - self._t0, 1)
+
+
 def build_boundary(
     product: str,
     iso: str,
@@ -712,8 +732,13 @@ def build_boundary(
     marks the boundary as failed (failed_stage "writePostGIS" /
     "uploadToS3") so strict mode aborts instead of promoting a release
     with missing CGAZ input or missing bucket objects.
+
+    The result's "timings" maps each stage that ran to its duration in
+    seconds, plus "total"; a failed build stops at the stage that failed.
     """
 
+    timer = _StageTimer()
+    timer.start("setup")
     tmpdir = tempfile.mkdtemp(prefix=f"gb-{product}-{iso}-{adm}-")
     tmpdir = Path(tmpdir)
     # Workers are long-lived within a run, so each boundary's build tree
@@ -725,7 +750,12 @@ def build_boundary(
         valid_licenses = license_df["license_name"].tolist()
         b = builder(iso, adm, product, valid_isos, valid_licenses, tmpdir=tmpdir)
 
-        result = {"product": product, "iso": iso, "adm": adm}
+        result = {
+            "product": product,
+            "iso": iso,
+            "adm": adm,
+            "timings": timer.timings,
+        }
         for stage_name, stage_fn in [
             ("checkExistence", b.checkExistence),
             ("checkSourceValidity", b.checkSourceValidity),
@@ -734,6 +764,7 @@ def build_boundary(
             ("calculateGeomMeta", b.calculateGeomMeta),
             ("constructFiles", b.constructFiles),
         ]:
+            timer.start(stage_name)
             try:
                 stage_result = stage_fn()
             except Exception as e:
@@ -750,6 +781,7 @@ def build_boundary(
         # Read back the exact metadata artifact that was written to the release
         # tree.  This record is also used to build the aggregate API index, which
         # keeps aggregate responses identical to per-boundary responses.
+        timer.start("loadMetadata")
         metadata_path = b.targetPath / f"geoBoundaries-{iso}-{adm}-metaData.json"
         try:
             with metadata_path.open(encoding="utf-8") as metadata_file:
@@ -774,6 +806,7 @@ def build_boundary(
         result["metadata"] = metadata
 
         # Push the built boundary to PostGIS for downstream CGAZ consumption.
+        timer.start("writePostGIS")
         try:
             geojson_path = (
                 b.targetPath / f"geoBoundaries-{iso}-{adm}.geojson"
@@ -814,6 +847,7 @@ def build_boundary(
         # Upload all outputs to S3-compatible storage.
         result["uploaded"] = []
         if s3_config:
+            timer.start("uploadToS3")
             try:
                 result["uploaded"] = upload_to_s3(
                     b.targetPath, f"{product}/{iso}/{adm}", s3_config
@@ -828,7 +862,10 @@ def build_boundary(
         result["status"] = "ok"
         return result
     finally:
+        timer.start("cleanup")
         shutil.rmtree(tmpdir, ignore_errors=True)
+        # `result` holds this same dict, so the returned timings are complete.
+        timer.stop()
 
 
 def run_boundary_builds(scheduler_url, db_url, s3_config=None, version="nightly"):
@@ -871,15 +908,17 @@ def run_boundary_builds(scheduler_url, db_url, s3_config=None, version="nightly"
 
     for future, result in as_completed(futures, with_results=True):
         tag = f"{result['product']}/{result['iso']}_{result['adm']}"
+        total = result.get("timings", {}).get("total", 0)
         if result["status"] == "ok":
             successes.append(result)
-            log.info("OK  %s", tag)
+            log.info("OK  %s (%.0fs)", tag, total)
         else:
             failures.append(result)
             log.error(
-                "FAIL %s stage=%s: %s",
+                "FAIL %s stage=%s (%.0fs): %s",
                 tag,
                 result.get("failed_stage"),
+                total,
                 result.get("error"),
             )
 
@@ -890,7 +929,40 @@ def run_boundary_builds(scheduler_url, db_url, s3_config=None, version="nightly"
         len(failures),
         elapsed,
     )
+    log_build_timings(successes + failures)
     return successes, failures
+
+
+def log_build_timings(results, slowest=15):
+    """Log where build time went: per-stage totals, then the slowest builds."""
+
+    timed = [r for r in results if r.get("timings", {}).get("total") is not None]
+    if not timed:
+        return
+
+    stage_totals = {}
+    for r in timed:
+        for stage, secs in r["timings"].items():
+            if stage != "total":
+                stage_totals[stage] = stage_totals.get(stage, 0) + secs
+    grand_total = sum(stage_totals.values()) or 1
+    log.info("Build time by stage, summed over %d builds:", len(timed))
+    for stage, secs in sorted(stage_totals.items(), key=lambda kv: -kv[1]):
+        log.info("  %-26s %8.0fs  %5.1f%%", stage, secs, 100 * secs / grand_total)
+
+    log.info("Slowest %d builds (seconds per stage):", min(slowest, len(timed)))
+    for r in sorted(timed, key=lambda r: -r["timings"]["total"])[:slowest]:
+        stages = "  ".join(
+            f"{stage}={secs:.0f}"
+            for stage, secs in r["timings"].items()
+            if stage != "total"
+        )
+        log.info(
+            "  %-22s %6.0fs  %s",
+            f"{r['product']}/{r['iso']}_{r['adm']}",
+            r["timings"]["total"],
+            stages,
+        )
 
 
 def _adm_sort_key(adm):
