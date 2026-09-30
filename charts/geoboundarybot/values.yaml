@@ -22,7 +22,7 @@ build:
     branch: main
     lfs: true
   dask:
-    workers: 4 # scale target during builds (scaled to 0 when idle)
+    workers: 48 # scale target during builds (scaled to 0 when idle)
   resources:
     requests:
       memory: 2Gi
