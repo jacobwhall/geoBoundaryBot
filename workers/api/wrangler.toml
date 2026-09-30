@@ -1,0 +1,24 @@
+name = "geoboundaries-api"
+main = "src/index.ts"
+compatibility_date = "2026-01-01"
+
+# Route /api/* on the public site through this Worker.
+# Everything else (docs, gbWeb) keeps hitting whatever origin is currently
+# configured for www.geoboundaries.org.
+[[routes]]
+pattern = "www.geoboundaries.org/api/*"
+zone_name = "geoboundaries.org"
+
+# R2 bucket holding the build outputs. The Python pipeline uploads here
+# under {GB_RELEASE_VERSION}/{product}/{ISO}/{ADM}/...
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "geoboundaries"
+
+# Public hostname of the R2 custom-domain binding. The Worker rewrites
+# URL fields in the metadata JSON to point here.
+[vars]
+DATA_DOMAIN = "data.geoboundaries.org"
+
+[observability]
+enabled = true
