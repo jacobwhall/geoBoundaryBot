@@ -843,6 +843,8 @@ def run_boundary_builds(scheduler_url, db_url, s3_config=None, version="nightly"
         log.info("Nothing to build.")
         return [], []
 
+    # Deeper ADM levels take longest, so start them first to shorten the
+    # tail.  Dask runs higher-priority tasks first.
     futures = {
         client.submit(
             build_boundary,
@@ -852,6 +854,7 @@ def run_boundary_builds(scheduler_url, db_url, s3_config=None, version="nightly"
             db_url,
             s3_config=s3_config,
             key=f"{version}-{product}-{iso}-{adm}",
+            priority=_adm_priority(adm),
         ): (product, iso, adm)
         for product, iso, adm in boundaries
     }
@@ -890,6 +893,13 @@ def _adm_sort_key(adm):
     if isinstance(adm, str) and adm.startswith("ADM") and adm[3:].isdigit():
         return int(adm[3:])
     return sys.maxsize
+
+
+def _adm_priority(adm):
+    """Dask priority for a boundary build: its ADM level, 0 if malformed."""
+
+    level = _adm_sort_key(adm)
+    return 0 if level == sys.maxsize else level
 
 
 def upload_api_indexes(successes, s3_config):
