@@ -32,6 +32,7 @@ import subprocess
 import tempfile
 import threading
 from datetime import datetime, timedelta, timezone
+import kr8s
 from kr8s import NotFoundError, ServerError
 from kr8s.objects import Deployment, PersistentVolumeClaim, Service, new_class
 import sys
@@ -320,6 +321,25 @@ def _delete_and_wait(obj, timeout=60):
     log.warning("Timed out waiting for %s/%s deletion", obj.kind, obj.name)
 
 
+def _builddb_labels(release):
+    return {
+        "app.kubernetes.io/instance": release,
+        "app.kubernetes.io/component": "builddb",
+    }
+
+
+def _delete_builddb_pvcs(release, ns, wait=True):
+    """Delete every build-database PVC for this release, found by label."""
+    for pvc in kr8s.get(
+        "persistentvolumeclaims", namespace=ns, label_selector=_builddb_labels(release)
+    ):
+        if wait:
+            _delete_and_wait(pvc)
+        else:
+            pvc.delete()
+            log.info("Deleted %s/%s", pvc.kind, pvc.name)
+
+
 def create_build_db(timeout=120):
     """Create an ephemeral PostGIS PVC + Deployment + Service for build outputs.
 
@@ -332,11 +352,12 @@ def create_build_db(timeout=120):
     storage_class = os.environ.get("GB_BUILDDB_STORAGE_CLASS", "")
     storage_size = os.environ.get("GB_BUILDDB_STORAGE_SIZE", "50Gi")
     name = f"{release}-builddb"
+    # Unique per run: reusing a claim name before the old PV is reclaimed lets
+    # the vcluster syncer bind the new claim to the dying volume, leaving it
+    # Pending forever once the provisioner deletes that volume.
+    pvc_name = f"{name}-{int(time.time())}"
 
-    labels = {
-        "app.kubernetes.io/instance": release,
-        "app.kubernetes.io/component": "builddb",
-    }
+    labels = _builddb_labels(release)
 
     pvc_spec = {
         "accessModes": ["ReadWriteOnce"],
@@ -349,7 +370,7 @@ def create_build_db(timeout=120):
         {
             "apiVersion": "v1",
             "kind": "PersistentVolumeClaim",
-            "metadata": {"name": name, "namespace": ns, "labels": labels},
+            "metadata": {"name": pvc_name, "namespace": ns, "labels": labels},
             "spec": pvc_spec,
         }
     )
@@ -408,7 +429,7 @@ def create_build_db(timeout=120):
                         "volumes": [
                             {
                                 "name": "pgdata",
-                                "persistentVolumeClaim": {"claimName": name},
+                                "persistentVolumeClaim": {"claimName": pvc_name},
                             }
                         ],
                     },
@@ -431,7 +452,7 @@ def create_build_db(timeout=120):
 
     log.info(
         "Creating build database: %s (%s on %s)",
-        name,
+        pvc_name,
         storage_size,
         storage_class or "default storage class",
     )
@@ -441,7 +462,7 @@ def create_build_db(timeout=120):
     # keeps the PVC in Terminating state).
     _delete_and_wait(deploy)
     _delete_and_wait(svc)
-    _delete_and_wait(pvc)
+    _delete_builddb_pvcs(release, ns)
 
     pvc.create()
     deploy.create()
@@ -527,13 +548,17 @@ def teardown_build_db():
     ns = os.environ.get("GB_NAMESPACE", "default")
     name = f"{release}-builddb"
 
-    for cls in (Deployment, Service, PersistentVolumeClaim):
+    for cls in (Deployment, Service):
         try:
             obj = cls.get(name, namespace=ns)
             obj.delete()
             log.info("Deleted %s/%s", cls.kind, name)
         except Exception:
             log.warning("Could not delete %s/%s", cls.kind, name, exc_info=True)
+    try:
+        _delete_builddb_pvcs(release, ns, wait=False)
+    except Exception:
+        log.warning("Could not delete build database PVCs", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
