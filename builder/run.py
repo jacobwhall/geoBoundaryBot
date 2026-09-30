@@ -475,6 +475,19 @@ def create_build_db(timeout=120):
     return db_url
 
 
+BOUNDARIES_COLUMNS = [
+    "product",
+    "iso",
+    "adm_level",
+    "shape_name",
+    "shape_iso",
+    "shape_id",
+    "shape_group",
+    "shape_type",
+    "geom",
+]
+
+
 def _init_build_db_schema(db_url):
     """Enable PostGIS and create the boundaries table."""
 
@@ -489,6 +502,7 @@ def _init_build_db_schema(db_url):
                 iso TEXT NOT NULL,
                 adm_level TEXT NOT NULL,
                 shape_name TEXT,
+                shape_iso TEXT,
                 shape_id TEXT,
                 shape_group TEXT,
                 shape_type TEXT,
@@ -729,10 +743,14 @@ def build_boundary(
             gdf = gdf.rename(columns={
                 "geometry": "geom",
                 "shapeName": "shape_name",
+                "shapeISO": "shape_iso",
                 "shapeID": "shape_id",
                 "shapeGroup": "shape_group",
                 "shapeType": "shape_type",
             }).set_geometry("geom")
+            # to_postgis appends every column, so drop anything the table
+            # doesn't define rather than failing the whole boundary.
+            gdf = gdf[[c for c in BOUNDARIES_COLUMNS if c in gdf.columns]]
 
             engine = create_engine(db_url)
             gdf.to_postgis(
