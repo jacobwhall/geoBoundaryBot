@@ -24,6 +24,10 @@ CGAZOutputPath = str(RELEASE_DATA / "CGAZ") + "/"
 stdGeom = str(LSIB_GEOJSON)
 stdISO = str(ISO_CSV)
 
+# Node heap for the global merges in join_admins. Each level combines ~3GB of
+# GeoJSON; node's 4GB default and mapshaper-xl's 8GB default both run out.
+MERGE_HEAP = os.environ.get("GB_CGAZ_MERGE_HEAP", "32gb")
+
 logger = logging.getLogger(__name__)
 
 
@@ -417,6 +421,13 @@ def filter_attributes(gdf, adm_level):
     return result[columns_to_keep]
 
 
+def merge_cmd(command):
+    """Run a global mapshaper merge, failing loudly if it doesn't finish."""
+    r = cmd(command)
+    if r.returncode != 0:
+        raise RuntimeError(f"mapshaper merge failed (rc={r.returncode})")
+
+
 def join_admins(adm0str, adm1str, adm2str):
     """Join ADM levels and ensure only required attributes are kept."""
     logger.debug("Joining ADM0 / ADM1 / ADM2s together into one large geom.")
@@ -425,7 +436,7 @@ def join_admins(adm0str, adm1str, adm2str):
     logger.debug(f"ADM2: {adm2str}")
 
     A0mapShaperFull = (
-        "mapshaper-xl -i "
+        f"mapshaper-xl {MERGE_HEAP} -i "
         + adm0str
         + " "
         + outPath
@@ -443,7 +454,7 @@ def join_admins(adm0str, adm1str, adm2str):
         + (outPath + "geoBoundariesCGAZ_ADM0.shp")
     )
     A1mapShaperFull = (
-        "mapshaper-xl -i "
+        f"mapshaper-xl {MERGE_HEAP} -i "
         + adm1str
         + " "
         + outPath
@@ -461,7 +472,7 @@ def join_admins(adm0str, adm1str, adm2str):
         + (outPath + "geoBoundariesCGAZ_ADM1.shp")
     )
     A2mapShaperFull = (
-        "mapshaper-xl -i "
+        f"mapshaper-xl {MERGE_HEAP} -i "
         + adm2str
         + " "
         + outPath
@@ -507,17 +518,17 @@ def join_admins(adm0str, adm1str, adm2str):
     # Process ADM0 with mapshaper
     logger.info("Starting ADM0 mapshaper processing...")
     logger.info(A0mapShaperFull)
-    cmd(A0mapShaperFull)
+    merge_cmd(A0mapShaperFull)
 
     # Process ADM1 with mapshaper
     logger.info("Starting ADM1 mapshaper processing...")
     logger.info(A1mapShaperFull)
-    cmd(A1mapShaperFull)
+    merge_cmd(A1mapShaperFull)
 
     # Process ADM2 with mapshaper
     logger.info("Starting ADM2 mapshaper processing...")
     logger.info(A2mapShaperFull)
-    cmd(A2mapShaperFull)
+    merge_cmd(A2mapShaperFull)
 
     # Now process each ADM level to generate final outputs
     for adm_level in ["ADM0", "ADM1", "ADM2"]:

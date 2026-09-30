@@ -1285,7 +1285,7 @@ def lsib_url(s3_config, expires=7200):
 # ---------------------------------------------------------------------------
 
 
-def run_cgaz_job(db_url, lsib_url, timeout=7200):
+def run_cgaz_job(db_url, lsib_url, timeout=14400):
     """Create a one-shot Kubernetes Job for CGAZ processing and wait for it."""
 
     release = os.environ["GB_RELEASE_NAME"]
@@ -1305,7 +1305,9 @@ def run_cgaz_job(db_url, lsib_url, timeout=7200):
             },
         },
         "spec": {
-            "backoffLimit": 1,
+            # CGAZ failures so far have been deterministic (bad input, OOM),
+            # so a retry just burns another hour.
+            "backoffLimit": 0,
             "ttlSecondsAfterFinished": 3600,
             "template": {
                 "spec": {
@@ -1334,6 +1336,12 @@ def run_cgaz_job(db_url, lsib_url, timeout=7200):
                                     "value": lsib_url,
                                 },
                             ],
+                            # Room for the global mapshaper merges (see
+                            # MERGE_HEAP in cgaz_builder) plus the per-country
+                            # process pool.
+                            "resources": {
+                                "requests": {"cpu": "4", "memory": "32Gi"},
+                            },
                             "volumeMounts": [
                                 {
                                     "name": "data",
@@ -1359,15 +1367,31 @@ def run_cgaz_job(db_url, lsib_url, timeout=7200):
     job = Job(manifest)
     job.create()
 
+    # Poll rather than job.wait(): kr8s's wait returns silently when the API
+    # server closes the watch (30–60 min), which read as a failure mid-run.
     log.info("Waiting for CGAZ job (timeout %ds)…", timeout)
-    job.wait(["condition=Complete", "condition=Failed"], timeout=timeout)
-    job.refresh()
+    deadline = time.monotonic() + timeout
+    while True:
+        job.refresh()
+        finished = {
+            c["type"]
+            for c in job.status.get("conditions", [])
+            if c["type"] in ("Complete", "Failed") and c["status"] == "True"
+        }
+        if "Complete" in finished:
+            log.info("CGAZ job %s completed successfully", job_name)
+            return True
+        if "Failed" in finished:
+            log.error("CGAZ job %s failed", job_name)
+            return False
+        if time.monotonic() > deadline:
+            break
+        time.sleep(30)
 
-    if (job.status.get("succeeded") or 0) >= 1:
-        log.info("CGAZ job %s completed successfully", job_name)
-        return True
-
-    log.error("CGAZ job %s failed", job_name)
+    # Don't leave it running unsupervised: a retried build would start
+    # another CGAZ job alongside it.
+    log.error("CGAZ job %s still running after %ds; deleting it", job_name, timeout)
+    job.delete(propagation_policy="Background")
     return False
 
 
