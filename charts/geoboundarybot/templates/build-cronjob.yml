@@ -10,6 +10,9 @@ metadata:
     app.kubernetes.io/component: build-{{ $name }}
 spec:
   schedule: {{ $cfg.schedule | quote }}
+  {{- with $.Values.build.timeZone }}
+  timeZone: {{ . | quote }}
+  {{- end }}
   suspend: {{ $cfg.suspend }}
   concurrencyPolicy: Forbid
   jobTemplate:

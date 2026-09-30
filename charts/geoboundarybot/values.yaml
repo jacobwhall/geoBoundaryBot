@@ -31,6 +31,9 @@ build:
       memory: 4Gi
       cpu: "2"
 
+  # IANA time zone the CronJob schedules below are read in.
+  timeZone: America/New_York
+
   nightly:
     schedule: "0 2 * * *"
     suspend: false
