@@ -28,6 +28,7 @@ import boto3
 from botocore.config import Config as BotoConfig
 import logging
 import os
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -699,115 +700,119 @@ def build_boundary(
 
     tmpdir = tempfile.mkdtemp(prefix=f"gb-{product}-{iso}-{adm}-")
     tmpdir = Path(tmpdir)
-
-    iso_df = pd.read_csv(ISO_CSV)
-    license_df = pd.read_csv(LICENSES_CSV)
-    valid_isos = iso_df["Alpha-3code"].tolist()
-    valid_licenses = license_df["license_name"].tolist()
-    b = builder(iso, adm, product, valid_isos, valid_licenses, tmpdir=tmpdir)
-
-    result = {"product": product, "iso": iso, "adm": adm}
-    for stage_name, stage_fn in [
-        ("checkExistence", b.checkExistence),
-        ("checkSourceValidity", b.checkSourceValidity),
-        ("checkBuildTabularMetaData", b.checkBuildTabularMetaData),
-        ("checkBuildGeometryFiles", b.checkBuildGeometryFiles),
-        ("calculateGeomMeta", b.calculateGeomMeta),
-        ("constructFiles", b.constructFiles),
-    ]:
-        try:
-            stage_result = stage_fn()
-        except Exception as e:
-            result["status"] = "error"
-            result["failed_stage"] = stage_name
-            result["error"] = str(e)
-            return result
-        if isinstance(stage_result, str) and "ERROR" in stage_result.upper():
-            result["status"] = "error"
-            result["failed_stage"] = stage_name
-            result["error"] = stage_result
-            return result
-
-    # Read back the exact metadata artifact that was written to the release
-    # tree.  This record is also used to build the aggregate API index, which
-    # keeps aggregate responses identical to per-boundary responses.
-    metadata_path = b.targetPath / f"geoBoundaries-{iso}-{adm}-metaData.json"
+    # Workers are long-lived within a run, so each boundary's build tree
+    # has to go as soon as it's uploaded or /tmp fills the node's disk.
     try:
-        with metadata_path.open(encoding="utf-8") as metadata_file:
-            metadata = json.load(metadata_file)
-        if not isinstance(metadata, dict):
-            raise ValueError("metadata root must be a JSON object")
-        if metadata.get("boundaryISO") != iso:
-            raise ValueError(
-                f"boundaryISO must be {iso!r}, got {metadata.get('boundaryISO')!r}"
-            )
-        if metadata.get("boundaryType") != adm:
-            raise ValueError(
-                f"boundaryType must be {adm!r}, got {metadata.get('boundaryType')!r}"
-            )
-    except Exception as e:
-        log.error("Metadata load failed for %s/%s_%s: %s", product, iso, adm, e)
-        result["status"] = "error"
-        result["failed_stage"] = "loadMetadata"
-        result["error"] = str(e)
-        return result
+        iso_df = pd.read_csv(ISO_CSV)
+        license_df = pd.read_csv(LICENSES_CSV)
+        valid_isos = iso_df["Alpha-3code"].tolist()
+        valid_licenses = license_df["license_name"].tolist()
+        b = builder(iso, adm, product, valid_isos, valid_licenses, tmpdir=tmpdir)
 
-    result["metadata"] = metadata
+        result = {"product": product, "iso": iso, "adm": adm}
+        for stage_name, stage_fn in [
+            ("checkExistence", b.checkExistence),
+            ("checkSourceValidity", b.checkSourceValidity),
+            ("checkBuildTabularMetaData", b.checkBuildTabularMetaData),
+            ("checkBuildGeometryFiles", b.checkBuildGeometryFiles),
+            ("calculateGeomMeta", b.calculateGeomMeta),
+            ("constructFiles", b.constructFiles),
+        ]:
+            try:
+                stage_result = stage_fn()
+            except Exception as e:
+                result["status"] = "error"
+                result["failed_stage"] = stage_name
+                result["error"] = str(e)
+                return result
+            if isinstance(stage_result, str) and "ERROR" in stage_result.upper():
+                result["status"] = "error"
+                result["failed_stage"] = stage_name
+                result["error"] = stage_result
+                return result
 
-    # Push the built boundary to PostGIS for downstream CGAZ consumption.
-    try:
-        geojson_path = (
-            b.targetPath / f"geoBoundaries-{iso}-{adm}.geojson"
-        )
-        if geojson_path.exists():
-            gdf = gpd.read_file(geojson_path)
-            gdf = gdf.to_crs(epsg=4326)
-            gdf["product"] = product
-            gdf["iso"] = iso
-            gdf["adm_level"] = adm
-            gdf = gdf.rename(columns={
-                "geometry": "geom",
-                "shapeName": "shape_name",
-                "shapeISO": "shape_iso",
-                "shapeID": "shape_id",
-                "shapeGroup": "shape_group",
-                "shapeType": "shape_type",
-            }).set_geometry("geom")
-            # to_postgis appends every column, so drop anything the table
-            # doesn't define rather than failing the whole boundary.
-            gdf = gdf[[c for c in BOUNDARIES_COLUMNS if c in gdf.columns]]
-
-            engine = create_engine(db_url)
-            gdf.to_postgis(
-                "boundaries",
-                engine,
-                if_exists="append",
-                index=False,
-            )
-            engine.dispose()
-    except Exception as e:
-        log.error("PostGIS write failed for %s/%s_%s: %s", product, iso, adm, e)
-        result["status"] = "error"
-        result["failed_stage"] = "writePostGIS"
-        result["error"] = str(e)
-        return result
-
-    # Upload all outputs to S3-compatible storage.
-    result["uploaded"] = []
-    if s3_config:
+        # Read back the exact metadata artifact that was written to the release
+        # tree.  This record is also used to build the aggregate API index, which
+        # keeps aggregate responses identical to per-boundary responses.
+        metadata_path = b.targetPath / f"geoBoundaries-{iso}-{adm}-metaData.json"
         try:
-            result["uploaded"] = upload_to_s3(
-                b.targetPath, f"{product}/{iso}/{adm}", s3_config
-            )
+            with metadata_path.open(encoding="utf-8") as metadata_file:
+                metadata = json.load(metadata_file)
+            if not isinstance(metadata, dict):
+                raise ValueError("metadata root must be a JSON object")
+            if metadata.get("boundaryISO") != iso:
+                raise ValueError(
+                    f"boundaryISO must be {iso!r}, got {metadata.get('boundaryISO')!r}"
+                )
+            if metadata.get("boundaryType") != adm:
+                raise ValueError(
+                    f"boundaryType must be {adm!r}, got {metadata.get('boundaryType')!r}"
+                )
         except Exception as e:
-            log.error("S3 upload failed for %s/%s_%s: %s", product, iso, adm, e)
+            log.error("Metadata load failed for %s/%s_%s: %s", product, iso, adm, e)
             result["status"] = "error"
-            result["failed_stage"] = "uploadToS3"
+            result["failed_stage"] = "loadMetadata"
             result["error"] = str(e)
             return result
 
-    result["status"] = "ok"
-    return result
+        result["metadata"] = metadata
+
+        # Push the built boundary to PostGIS for downstream CGAZ consumption.
+        try:
+            geojson_path = (
+                b.targetPath / f"geoBoundaries-{iso}-{adm}.geojson"
+            )
+            if geojson_path.exists():
+                gdf = gpd.read_file(geojson_path)
+                gdf = gdf.to_crs(epsg=4326)
+                gdf["product"] = product
+                gdf["iso"] = iso
+                gdf["adm_level"] = adm
+                gdf = gdf.rename(columns={
+                    "geometry": "geom",
+                    "shapeName": "shape_name",
+                    "shapeISO": "shape_iso",
+                    "shapeID": "shape_id",
+                    "shapeGroup": "shape_group",
+                    "shapeType": "shape_type",
+                }).set_geometry("geom")
+                # to_postgis appends every column, so drop anything the table
+                # doesn't define rather than failing the whole boundary.
+                gdf = gdf[[c for c in BOUNDARIES_COLUMNS if c in gdf.columns]]
+
+                engine = create_engine(db_url)
+                gdf.to_postgis(
+                    "boundaries",
+                    engine,
+                    if_exists="append",
+                    index=False,
+                )
+                engine.dispose()
+        except Exception as e:
+            log.error("PostGIS write failed for %s/%s_%s: %s", product, iso, adm, e)
+            result["status"] = "error"
+            result["failed_stage"] = "writePostGIS"
+            result["error"] = str(e)
+            return result
+
+        # Upload all outputs to S3-compatible storage.
+        result["uploaded"] = []
+        if s3_config:
+            try:
+                result["uploaded"] = upload_to_s3(
+                    b.targetPath, f"{product}/{iso}/{adm}", s3_config
+                )
+            except Exception as e:
+                log.error("S3 upload failed for %s/%s_%s: %s", product, iso, adm, e)
+                result["status"] = "error"
+                result["failed_stage"] = "uploadToS3"
+                result["error"] = str(e)
+                return result
+
+        result["status"] = "ok"
+        return result
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def run_boundary_builds(scheduler_url, db_url, s3_config=None, version="nightly"):
