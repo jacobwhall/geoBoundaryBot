@@ -103,6 +103,7 @@ ipython_config.py
 # JavaScript dependencies
 /workers/api/node_modules/
 /workers/api/.test-dist/
+/workers/api/.wrangler/
 
 # poetry
 #   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
