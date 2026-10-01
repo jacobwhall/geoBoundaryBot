@@ -66,9 +66,11 @@ OUTPUT_DIR = TMP_DIR / "CGAZ"
 # PostGIS schema
 # ---------------------------------------------------------------------------
 
+# UNLOGGED, like the boundaries table: the build database lasts one run, so
+# these skip the write-ahead log (see run.create_build_db).
 SCHEMA = [
     """
-    CREATE TABLE IF NOT EXISTS cgaz_lsib (
+    CREATE UNLOGGED TABLE IF NOT EXISTS cgaz_lsib (
         id SERIAL PRIMARY KEY,
         iso TEXT,
         name TEXT,
@@ -78,7 +80,7 @@ SCHEMA = [
     """,
     "CREATE INDEX IF NOT EXISTS idx_cgaz_lsib_iso ON cgaz_lsib (iso)",
     """
-    CREATE TABLE IF NOT EXISTS cgaz_parts (
+    CREATE UNLOGGED TABLE IF NOT EXISTS cgaz_parts (
         id SERIAL PRIMARY KEY,
         iso TEXT NOT NULL,
         adm_level TEXT NOT NULL,
@@ -91,7 +93,7 @@ SCHEMA = [
     """,
     "CREATE INDEX IF NOT EXISTS idx_cgaz_parts_lookup ON cgaz_parts (adm_level, iso)",
     """
-    CREATE TABLE IF NOT EXISTS cgaz_outputs (
+    CREATE UNLOGGED TABLE IF NOT EXISTS cgaz_outputs (
         key TEXT PRIMARY KEY,
         size BIGINT NOT NULL
     )

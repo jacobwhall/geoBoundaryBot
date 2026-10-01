@@ -369,6 +369,26 @@ def create_build_db(timeout=120):
     # boundary, each CGAZ task reads and writes parts), and Postgres's
     # default of 100 is well under 48 workers x 4 threads.
     max_connections = os.environ.get("GB_BUILDDB_MAX_CONNECTIONS", "500")
+    cpu = os.environ.get("GB_BUILDDB_CPU", "4")
+    memory = os.environ.get("GB_BUILDDB_MEMORY", "16Gi")
+    # A quarter of the memory request, per the usual Postgres advice.
+    shared_buffers = os.environ.get("GB_BUILDDB_SHARED_BUFFERS", "4GB")
+    settings = {
+        "max_connections": max_connections,
+        # The database lasts one run, and a crash mid-run means rerunning
+        # anyway, so skip the crash-safety work that's slow on NFS: no
+        # commit-time syncs, no full-page images in the WAL.  (The tables
+        # are also UNLOGGED, so they skip the WAL entirely.)
+        "fsync": "off",
+        "synchronous_commit": "off",
+        "full_page_writes": "off",
+        # Big boundary geometries are TOASTed; lz4 compresses them far
+        # faster than the default pglz.
+        "default_toast_compression": "lz4",
+        "shared_buffers": shared_buffers,
+        "max_wal_size": "16GB",
+        "checkpoint_timeout": "30min",
+    }
     name = f"{release}-builddb"
     # Unique per run: reusing a claim name before the old PV is reclaimed lets
     # the vcluster syncer bind the new claim to the dying volume, leaving it
@@ -415,9 +435,15 @@ def create_build_db(timeout=120):
                                 "image": image,
                                 "args": [
                                     "postgres",
-                                    "-c",
-                                    f"max_connections={max_connections}",
+                                    *(
+                                        arg
+                                        for key, value in settings.items()
+                                        for arg in ("-c", f"{key}={value}")
+                                    ),
                                 ],
+                                "resources": {
+                                    "requests": {"cpu": cpu, "memory": memory},
+                                },
                                 "env": [
                                     {"name": "POSTGRES_DB", "value": "geoboundaries"},
                                     {"name": "POSTGRES_USER", "value": "gb"},
@@ -540,7 +566,7 @@ def _init_build_db_schema(db_url):
         conn.execute(text("CREATE EXTENSION IF NOT EXISTS postgis"))
         conn.execute(
             text("""
-            CREATE TABLE IF NOT EXISTS boundaries (
+            CREATE UNLOGGED TABLE IF NOT EXISTS boundaries (
                 id SERIAL PRIMARY KEY,
                 product TEXT NOT NULL,
                 iso TEXT NOT NULL,
