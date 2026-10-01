@@ -11,10 +11,15 @@ Orchestrates the full build:
   3. Scale up Dask workers
   4. Discover boundaries and fan out builds across Dask
      (each worker pushes its output geometries to PostGIS and uploads
-      its build outputs to S3 under {GB_RELEASE_VERSION}/...)
+      its build outputs to S3 under {GB_RELEASE_VERSION}/...).
+     The per-country CGAZ work rides along on the same cluster: one task
+     loads LSIB into PostGIS, and each gbOpen country gets a task that
+     starts as soon as its ADM0-2 builds finish (see builder.cgaz_builder)
   5. Scale down Dask workers
   6. Publish per-product API indexes to S3
-  7. Launch a single-pod CGAZ Job that reads from PostGIS
+  7. Launch a single-pod CGAZ Job that merges the per-country parts from
+     PostGIS into global layers and uploads them under
+     {GB_RELEASE_VERSION}/CGAZ/
   8. If GB_PROMOTE_CURRENT=true, verify every uploaded object exists in
      the bucket
   9. If GB_PROMOTE_CURRENT=true, write current.json to the bucket root
@@ -25,9 +30,6 @@ Orchestrates the full build:
 
 import hashlib
 import json
-import mimetypes
-import boto3
-from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError
 import logging
 import os
@@ -54,6 +56,9 @@ import requests
 from sqlalchemy import create_engine
 from dask.distributed import Client, as_completed
 from kr8s.objects import Job
+from builder import cgaz_builder
+from builder.s3 import s3_client as _s3_client
+from builder.s3 import s3_config_from_env, upload_to_s3
 
 log = logging.getLogger(__name__)
 
@@ -515,7 +520,7 @@ BOUNDARIES_COLUMNS = [
 
 
 def _init_build_db_schema(db_url):
-    """Enable PostGIS and create the boundaries table."""
+    """Enable PostGIS and create the boundaries and CGAZ tables."""
 
     engine = create_engine(db_url)
     with engine.begin() as conn:
@@ -542,6 +547,7 @@ def _init_build_db_schema(db_url):
                 "ON boundaries (product, iso, adm_level)"
             )
         )
+        cgaz_builder.init_schema(conn)
     engine.dispose()
     log.info("Build database schema initialized")
 
@@ -625,74 +631,6 @@ def discover_boundaries(products=None):
             else:
                 log.warning("Skipping malformed filename: %s", zip_file.name)
     return boundaries
-
-
-def _s3_client(s3_config):
-    """Build a boto3 S3 client with standard retries for transient errors."""
-
-    return boto3.client(
-        "s3",
-        endpoint_url=s3_config["endpoint"],
-        aws_access_key_id=s3_config["access_key_id"],
-        aws_secret_access_key=s3_config["secret_access_key"],
-        # R2 only accepts SigV4. Requests default to it anyway, but presigned
-        # URLs fall back to legacy SigV2 unless it's set explicitly.
-        region_name="auto",
-        config=BotoConfig(
-            signature_version="s3v4",
-            retries={"max_attempts": 5, "mode": "standard"},
-        ),
-    )
-
-
-def upload_to_s3(output_dir, key_prefix, s3_config):
-    """Upload all build outputs for a boundary to S3-compatible storage.
-
-    Keys mirror the release directory structure so the bucket can be
-    served directly as a drop-in replacement for the file server:
-        {product}/{ISO}/{ADM}/geoBoundaries-{ISO}-{ADM}.geojson
-        {product}/{ISO}/{ADM}/geoBoundaries-{ISO}-{ADM}-metaData.json
-        ...
-
-    Args:
-        output_dir: Path to the directory containing build outputs.
-        key_prefix: Prefix for S3 keys (e.g. "gbOpen/USA/ADM1").
-        s3_config: Dict with endpoint, access_key_id, secret_access_key, bucket.
-
-    Returns a manifest: a list of {"key", "size"} dicts, one per uploaded
-    file, with the full bucket key (including the global prefix).  Raises
-    if the output directory is missing or empty, or if any upload fails
-    after retries.
-    """
-
-    if not output_dir.is_dir():
-        raise FileNotFoundError(f"Build output directory missing: {output_dir}")
-
-    s3 = _s3_client(s3_config)
-    bucket = s3_config["bucket"]
-    global_prefix = s3_config.get("prefix", "")
-
-    manifest = []
-    for file_path in output_dir.rglob("*"):
-        if not file_path.is_file():
-            continue
-        key = f"{key_prefix}/{file_path.relative_to(output_dir)}"
-        if global_prefix:
-            key = f"{global_prefix}/{key}"
-        content_type, _ = mimetypes.guess_type(str(file_path))
-        extra_args = {}
-        if content_type:
-            extra_args["ContentType"] = content_type
-        s3.upload_file(str(file_path), bucket, key, ExtraArgs=extra_args)
-        manifest.append({"key": key, "size": file_path.stat().st_size})
-
-    if not manifest:
-        raise FileNotFoundError(f"Build output directory is empty: {output_dir}")
-
-    log.info(
-        "Uploaded %d file(s) for %s to s3://%s/", len(manifest), key_prefix, bucket
-    )
-    return manifest
 
 
 class _StageTimer:
@@ -829,14 +767,26 @@ def build_boundary(
                 # doesn't define rather than failing the whole boundary.
                 gdf = gdf[[c for c in BOUNDARIES_COLUMNS if c in gdf.columns]]
 
+                # Replace rather than append: Dask reruns a task whose worker
+                # died, and duplicate rows would overlap in CGAZ.
                 engine = create_engine(db_url)
-                gdf.to_postgis(
-                    "boundaries",
-                    engine,
-                    if_exists="append",
-                    index=False,
-                )
-                engine.dispose()
+                try:
+                    with engine.begin() as conn:
+                        conn.execute(
+                            text(
+                                "DELETE FROM boundaries WHERE product = :product "
+                                "AND iso = :iso AND adm_level = :adm"
+                            ),
+                            {"product": product, "iso": iso, "adm": adm},
+                        )
+                        gdf.to_postgis(
+                            "boundaries",
+                            conn,
+                            if_exists="append",
+                            index=False,
+                        )
+                finally:
+                    engine.dispose()
         except Exception as e:
             log.error("PostGIS write failed for %s/%s_%s: %s", product, iso, adm, e)
             result["status"] = "error"
@@ -868,11 +818,60 @@ def build_boundary(
         timer.stop()
 
 
-def run_boundary_builds(scheduler_url, db_url, s3_config=None, version="nightly"):
-    """Connect to Dask, discover boundaries, fan out work.
+def submit_cgaz_tasks(client, builds, db_url, lsib_url, version):
+    """Queue the per-country CGAZ tasks behind the gbOpen builds they read.
 
-    Returns (successes, failures): two lists of the per-boundary result
-    dicts returned by `build_boundary`.
+    `builds` maps each build future to its (product, iso, adm, size).  Each
+    country's task takes its gbOpen ADM0-2 build futures as arguments, so
+    Dask starts it once those builds finish while other builds are still
+    running.  Priorities follow the builds' biggest-first ordering: LSIB
+    goes ahead of everything, and each country is weighted by the source
+    size of the boundaries it clips.
+
+    Returns {future: tag} for the LSIB task and every country task.
+    """
+
+    by_iso = {}
+    for future, (product, iso, adm, size) in builds.items():
+        if product == "gbOpen" and adm in cgaz_builder.LEVELS:
+            deps = by_iso.setdefault(iso, {"futures": [], "size": 0})
+            deps["futures"].append(future)
+            deps["size"] += size
+
+    lsib = client.submit(
+        cgaz_builder.prepare_lsib,
+        lsib_url,
+        db_url,
+        key=f"{version}-cgaz-lsib",
+        priority=max((size for *_, size in builds.values()), default=0) + 1,
+    )
+    tasks = {lsib: "CGAZ/LSIB"}
+    for iso, deps in sorted(by_iso.items()):
+        future = client.submit(
+            cgaz_builder.build_cgaz_country,
+            iso,
+            db_url,
+            lsib,
+            *deps["futures"],
+            key=f"{version}-cgaz-{iso}",
+            priority=deps["size"],
+        )
+        tasks[future] = f"CGAZ/{iso}"
+    log.info("Queued CGAZ work for %d gbOpen countries", len(by_iso))
+    return tasks
+
+
+def run_boundary_builds(
+    scheduler_url, db_url, lsib_url, s3_config=None, version="nightly", strict=False
+):
+    """Connect to Dask, discover boundaries, and fan out the builds together
+    with the per-country CGAZ work that reads their output.
+
+    Returns (successes, failures, cgaz_results): the per-boundary result
+    dicts returned by `build_boundary`, and the results of the CGAZ tasks.
+    In strict mode, if any build failed, the CGAZ tasks still outstanding
+    once the last build finishes are cancelled, since the run is going to
+    abort anyway.
     """
 
     log.info("Connecting to Dask scheduler at %s", scheduler_url)
@@ -884,11 +883,11 @@ def run_boundary_builds(scheduler_url, db_url, s3_config=None, version="nightly"
 
     if not boundaries:
         log.info("Nothing to build.")
-        return [], []
+        return [], [], []
 
     # Bigger source files take longest to build, so start them first to
     # shorten the tail.  Dask runs higher-priority tasks first.
-    futures = {
+    builds = {
         client.submit(
             build_boundary,
             product,
@@ -898,39 +897,84 @@ def run_boundary_builds(scheduler_url, db_url, s3_config=None, version="nightly"
             s3_config=s3_config,
             key=f"{version}-{product}-{iso}-{adm}",
             priority=size,
-        ): (product, iso, adm)
+        ): (product, iso, adm, size)
         for product, iso, adm, size in boundaries
     }
+    cgaz = submit_cgaz_tasks(client, builds, db_url, lsib_url, version)
 
     successes = []
     failures = []
+    cgaz_results = []
+    builds_left = len(builds)
     t0 = time.monotonic()
 
-    for future, result in as_completed(futures, with_results=True):
-        tag = f"{result['product']}/{result['iso']}_{result['adm']}"
-        total = result.get("timings", {}).get("total", 0)
-        if result["status"] == "ok":
-            successes.append(result)
-            log.info("OK  %s (%.0fs)", tag, total)
-        else:
-            failures.append(result)
-            log.error(
-                "FAIL %s stage=%s (%.0fs): %s",
-                tag,
-                result.get("failed_stage"),
-                total,
-                result.get("error"),
-            )
+    # raise_errors=False: a task that raised (e.g. its worker was OOM-killed
+    # too often) is logged as a failure instead of crashing the driver.
+    for future, result in as_completed(
+        [*builds, *cgaz], with_results=True, raise_errors=False
+    ):
+        if future in builds:
+            product, iso, adm, _ = builds[future]
+            if future.status == "error":
+                result = {
+                    "product": product,
+                    "iso": iso,
+                    "adm": adm,
+                    "status": "error",
+                    "failed_stage": "dask",
+                    "error": repr(result[1]),
+                }
+            tag = f"{product}/{iso}_{adm}"
+            total = result.get("timings", {}).get("total", 0)
+            if result["status"] == "ok":
+                successes.append(result)
+                log.info("OK  %s (%.0fs)", tag, total)
+            else:
+                failures.append(result)
+                log.error(
+                    "FAIL %s stage=%s (%.0fs): %s",
+                    tag,
+                    result.get("failed_stage"),
+                    total,
+                    result.get("error"),
+                )
 
-    elapsed = time.monotonic() - t0
+            builds_left -= 1
+            if builds_left == 0:
+                log.info(
+                    "Boundary builds: %d succeeded, %d failed in %.0fs",
+                    len(successes),
+                    len(failures),
+                    time.monotonic() - t0,
+                )
+                log_build_timings(successes + failures)
+                if strict and failures:
+                    client.cancel(list(cgaz))
+                    log.info("Cancelled outstanding CGAZ work (strict mode)")
+                    break
+            continue
+
+        tag = cgaz[future]
+        if future.status == "error":
+            result = {"status": "error", "error": repr(result[1])}
+        result["tag"] = tag
+        cgaz_results.append(result)
+        total = result.get("timings", {}).get("total", 0)
+        if result["status"] == "error":
+            log.error("FAIL %s (%.0fs): %s", tag, total, result.get("error"))
+        elif result["status"] == "skipped":
+            log.info("SKIP %s: %s", tag, result.get("reason"))
+        else:
+            log.info("OK  %s (%.0fs)", tag, total)
+
     log.info(
-        "Boundary builds: %d succeeded, %d failed in %.0fs",
-        len(successes),
-        len(failures),
-        elapsed,
+        "CGAZ tasks: %d ok, %d skipped, %d failed (%.0fs since the builds started)",
+        sum(r["status"] == "ok" for r in cgaz_results),
+        sum(r["status"] == "skipped" for r in cgaz_results),
+        sum(r["status"] == "error" for r in cgaz_results),
+        time.monotonic() - t0,
     )
-    log_build_timings(successes + failures)
-    return successes, failures
+    return successes, failures, cgaz_results
 
 
 def log_build_timings(results, slowest=15):
@@ -1043,11 +1087,12 @@ def upload_api_indexes(successes, s3_config):
     return manifest
 
 
-def verify_release_objects(successes, s3_config, index_objects=None):
+def verify_release_objects(successes, s3_config, index_objects=None, cgaz_objects=None):
     """Confirm every object uploaded by successful builds exists in the bucket.
 
     Lists the whole `{prefix}/` tree once and checks each key in each
-    success's upload manifest for presence and matching size.  Raises
+    success's upload manifest, plus the API indexes and CGAZ layers, for
+    presence and matching size.  Raises
     RuntimeError on any discrepancy so the caller never promotes a
     version with missing or truncated files.
     """
@@ -1086,16 +1131,20 @@ def verify_release_objects(successes, s3_config, index_objects=None):
                     f"(local {size}, bucket {in_bucket[key]})"
                 )
 
-    for entry in index_objects or []:
-        expected += 1
-        key, size = entry["key"], entry["size"]
-        if key not in in_bucket:
-            problems.append(f"API index: missing s3://{bucket}/{key}")
-        elif in_bucket[key] != size:
-            problems.append(
-                f"API index: size mismatch s3://{bucket}/{key} "
-                f"(local {size}, bucket {in_bucket[key]})"
-            )
+    if cgaz_objects is not None and not cgaz_objects:
+        problems.append("CGAZ: merge job uploaded nothing")
+
+    for label, entries in (("API index", index_objects), ("CGAZ", cgaz_objects)):
+        for entry in entries or []:
+            expected += 1
+            key, size = entry["key"], entry["size"]
+            if key not in in_bucket:
+                problems.append(f"{label}: missing s3://{bucket}/{key}")
+            elif in_bucket[key] != size:
+                problems.append(
+                    f"{label}: size mismatch s3://{bucket}/{key} "
+                    f"(local {size}, bucket {in_bucket[key]})"
+                )
 
     if problems:
         bar = "=" * 72
@@ -1141,6 +1190,40 @@ def promote_to_current(version, s3_config):
     )
     log.info("Promoted current → %s (wrote s3://%s/current.json)",
              version, s3_config["bucket"])
+
+
+def check_cgaz_results(cgaz_results, strict):
+    """Whether the CGAZ merge can go ahead, given the Dask CGAZ results.
+
+    A failed LSIB task is always fatal, since there's nothing to lay the
+    countries out on.  A failed country falls back to its LSIB outline in
+    every layer, which only non-strict runs accept.
+    """
+
+    lsib = next((r for r in cgaz_results if r.get("tag") == "CGAZ/LSIB"), None)
+    if lsib is None or lsib["status"] != "ok":
+        log.error(
+            "CGAZ LSIB base layer failed: %s",
+            lsib.get("error") if lsib else "task never finished",
+        )
+        return False
+
+    failed = [r for r in cgaz_results if r["status"] == "error"]
+    if failed:
+        bar = "=" * 72
+        log.error(bar)
+        log.error(
+            "  %d CGAZ country task(s) failed (%s)",
+            len(failed),
+            "strict mode — aborting" if strict else "using LSIB outlines instead",
+        )
+        log.error(bar)
+        for r in failed:
+            log.error("  %-30s %s", r["tag"], r.get("error"))
+        log.error(bar)
+        if strict:
+            return False
+    return True
 
 
 def log_failure_summary(failures, strict):
@@ -1264,10 +1347,10 @@ def stage_lsib(s3_config):
 
 
 def lsib_url(s3_config, expires=7200):
-    """A URL the CGAZ pod can download the LSIB file from without credentials.
+    """A URL the LSIB Dask task can download the file from without credentials.
 
-    `expires` matches run_cgaz_job's timeout, so the URL stays valid for
-    the Job's retry pod too.
+    The task is queued ahead of every build, so it normally starts within
+    seconds; `expires` leaves room for it to be rerun if its worker dies.
     """
 
     if s3_config is None:
@@ -1281,12 +1364,46 @@ def lsib_url(s3_config, expires=7200):
 
 
 # ---------------------------------------------------------------------------
-# Step 6 — CGAZ Job via kr8s
+# Step 7 — CGAZ merge Job via kr8s
 # ---------------------------------------------------------------------------
 
 
-def run_cgaz_job(db_url, lsib_url, timeout=14400):
-    """Create a one-shot Kubernetes Job for CGAZ processing and wait for it."""
+def _cgaz_job_env(db_url, version, s3_config):
+    """Env for the CGAZ merge pod: the build database, plus S3 if enabled."""
+
+    env = [
+        {"name": "DATABASE_URL", "value": db_url},
+        {"name": "GB_RELEASE_VERSION", "value": version},
+    ]
+    if s3_config is not None:
+        # Credentials come from the same Secret the driver uses, by reference.
+        secret = os.environ["GB_S3_CREDENTIALS_SECRET"]
+        env += [
+            {"name": "S3_ENDPOINT_URL", "value": s3_config["endpoint"]},
+            {"name": "S3_BUCKET", "value": s3_config["bucket"]},
+            {
+                "name": "AWS_ACCESS_KEY_ID",
+                "valueFrom": {
+                    "secretKeyRef": {"name": secret, "key": "access-key-id"}
+                },
+            },
+            {
+                "name": "AWS_SECRET_ACCESS_KEY",
+                "valueFrom": {
+                    "secretKeyRef": {"name": secret, "key": "secret-access-key"}
+                },
+            },
+        ]
+    return env
+
+
+def run_cgaz_job(db_url, version, s3_config, timeout=14400):
+    """Run the one-shot CGAZ merge Job and wait for it.
+
+    The Job reads the per-country parts the Dask tasks left in PostGIS,
+    merges them into global layers and uploads them under
+    {version}/CGAZ/.  It needs nothing from the data PVC.
+    """
 
     release = os.environ["GB_RELEASE_NAME"]
     ns = os.environ.get("GB_NAMESPACE", "default")
@@ -1322,39 +1439,11 @@ def run_cgaz_job(db_url, lsib_url, timeout=14400):
                                 "builder.cgaz_builder",
                                 "-vv",
                             ],
-                            "env": [
-                                {
-                                    "name": "GB_REPO_DIR",
-                                    "value": "/data/geoBoundaries",
-                                },
-                                {
-                                    "name": "DATABASE_URL",
-                                    "value": db_url,
-                                },
-                                {
-                                    "name": "GB_LSIB_URL",
-                                    "value": lsib_url,
-                                },
-                            ],
+                            "env": _cgaz_job_env(db_url, version, s3_config),
                             # Room for the global mapshaper merges (see
-                            # MERGE_HEAP in cgaz_builder) plus the per-country
-                            # process pool.
+                            # MERGE_HEAP in cgaz_builder).
                             "resources": {
                                 "requests": {"cpu": "4", "memory": "32Gi"},
-                            },
-                            "volumeMounts": [
-                                {
-                                    "name": "data",
-                                    "mountPath": "/data/geoBoundaries",
-                                },
-                            ],
-                        },
-                    ],
-                    "volumes": [
-                        {
-                            "name": "data",
-                            "persistentVolumeClaim": {
-                                "claimName": f"{release}-data",
                             },
                         },
                     ],
@@ -1395,6 +1484,20 @@ def run_cgaz_job(db_url, lsib_url, timeout=14400):
     return False
 
 
+def read_cgaz_outputs(db_url):
+    """The {"key", "size"} manifest the CGAZ merge Job recorded in PostGIS."""
+
+    engine = create_engine(db_url)
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("SELECT key, size FROM cgaz_outputs ORDER BY key")
+            ).all()
+    finally:
+        engine.dispose()
+    return [{"key": key, "size": size} for key, size in rows]
+
+
 # ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
@@ -1424,20 +1527,9 @@ def main():
     )
 
     # Build S3 config from env vars (None if not configured).
-    # The release version becomes the top-level key prefix so versions
-    # coexist in the bucket: v6/gbOpen/KEN/ADM1/..., nightly/gbOpen/...
-    s3_config = None
-    s3_endpoint = os.environ.get("S3_ENDPOINT_URL")
-    s3_bucket = os.environ.get("S3_BUCKET")
-    if s3_endpoint and s3_bucket:
-        s3_config = {
-            "endpoint": s3_endpoint,
-            "bucket": s3_bucket,
-            "prefix": version,
-            "access_key_id": os.environ["AWS_ACCESS_KEY_ID"],
-            "secret_access_key": os.environ["AWS_SECRET_ACCESS_KEY"],
-        }
-        log.info("S3 uploads enabled → s3://%s/%s/", s3_bucket, version)
+    s3_config = s3_config_from_env(version)
+    if s3_config:
+        log.info("S3 uploads enabled → s3://%s/%s/", s3_config["bucket"], version)
     else:
         log.info("S3 uploads disabled (S3_ENDPOINT_URL / S3_BUCKET not set)")
 
@@ -1499,16 +1591,23 @@ def _run_pipeline(version, strict, promote, dask_workers, scheduler, s3_config):
         scale_dask_workers(dask_workers)
 
         try:
-            # 4. Run boundary builds
-            log.info("=== Step 4: Running boundary builds ===")
-            successes, failures = run_boundary_builds(
-                scheduler, db_url, s3_config, version=version
+            # 4. Run boundary builds, with the per-country CGAZ work alongside
+            log.info("=== Step 4: Running boundary builds + per-country CGAZ ===")
+            successes, failures, cgaz_results = run_boundary_builds(
+                scheduler,
+                db_url,
+                lsib_url(s3_config),
+                s3_config,
+                version=version,
+                strict=strict,
             )
 
             if failures:
                 log_failure_summary(failures, strict=strict)
                 if strict:
                     sys.exit(1)
+            if not check_cgaz_results(cgaz_results, strict):
+                sys.exit(1)
         finally:
             # 5. Scale down Dask (always, even on failure)
             log.info("=== Step 5: Scaling Dask workers to 0 ===")
@@ -1525,17 +1624,20 @@ def _run_pipeline(version, strict, promote, dask_workers, scheduler, s3_config):
             log.info("=== Step 6: Publishing aggregate API indexes ===")
             index_objects = upload_api_indexes(successes, s3_config)
 
-        # 7. CGAZ
-        log.info("=== Step 7: Running CGAZ job ===")
-        cgaz_ok = run_cgaz_job(db_url, lsib_url(s3_config))
+        # 7. CGAZ merge
+        log.info("=== Step 7: Running CGAZ merge job ===")
+        cgaz_ok = run_cgaz_job(db_url, version, s3_config)
         if not cgaz_ok:
             log.error("CGAZ job failed")
             sys.exit(1)
+        cgaz_objects = read_cgaz_outputs(db_url) if s3_config else []
 
         # 8. Verify uploads, then promote `current` pointer (release runs only)
         if promote:
             log.info("=== Step 8: Verifying release objects in S3 ===")
-            verify_release_objects(successes, s3_config, index_objects)
+            verify_release_objects(
+                successes, s3_config, index_objects, cgaz_objects=cgaz_objects
+            )
             log.info("=== Step 9: Promoting current → %s ===", version)
             promote_to_current(version, s3_config)
     finally:

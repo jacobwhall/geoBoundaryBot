@@ -1,654 +1,655 @@
+"""CGAZ: Comprehensive Global Administrative Zones.
+
+Stitches gbOpen ADM0/ADM1/ADM2 into gap-free global layers whose
+international borders come from the US Department of State's LSIB
+(dta/usDoSLSIB_Mar2020.geojson) rather than from geoBoundaries itself.
+
+The work is split three ways so the parallel part runs on Dask alongside
+the boundary builds:
+
+  prepare_lsib        Dask task, once per run.  Downloads LSIB, folds
+                      territories into their parent country, assigns ISO
+                      codes and dissolves to one shape per country (and per
+                      disputed area) in `cgaz_lsib`.
+  build_cgaz_country  Dask task, one per gbOpen ISO.  Waits on LSIB and that
+                      country's gbOpen ADM0-2 builds, then simplifies its
+                      ADM1/ADM2 and clips them to the LSIB country outline
+                      into `cgaz_parts`.
+  merge (__main__)    Single-pod Kubernetes Job.  Assembles each global layer
+                      from PostGIS, closes small gaps, writes GeoJSON,
+                      GeoPackage and zipped Shapefile, uploads them, and
+                      records the upload manifest in `cgaz_outputs`.
+
+Everything moves through the build's ephemeral PostGIS; the only bucket
+traffic is the one LSIB download and the final upload.
+"""
+
+import argparse
 import logging
 import os
-import sys
-import warnings
 import shutil
+import subprocess
+import sys
+import tempfile
+import time
 import zipfile
-import traceback
-from subprocess import PIPE, run
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from pathlib import Path
 
 import geopandas as gpd
 import pandas as pd
 import requests
+from sqlalchemy import create_engine, make_url, text
 
-from builder.paths import RELEASE_DATA, TMP_DIR, ISO_CSV, LSIB_GEOJSON
+from builder.paths import ISO_CSV, TMP_DIR
+from builder.s3 import s3_config_from_env, upload_to_s3
 
-# Ignore warnings about using '()' in str.contains
-warnings.filterwarnings("ignore", "This pattern has match groups")
+log = logging.getLogger(__name__)
 
-# Derived paths
-outPath = str(TMP_DIR / "CGAZ") + "/"
-gBPath = str(RELEASE_DATA / "gbOpen") + "/"
-CGAZOutputPath = str(RELEASE_DATA / "CGAZ") + "/"
-stdGeom = str(LSIB_GEOJSON)
-stdISO = str(ISO_CSV)
+LEVELS = ["ADM0", "ADM1", "ADM2"]
 
-# Node heap for the global merges in join_admins. Each level combines ~3GB of
-# GeoJSON; node's 4GB default and mapshaper-xl's 8GB default both run out.
+# Node heap for mapshaper, in mapshaper-xl's "<n>gb" syntax.  The global
+# merges hold a whole layer in memory; per-country clips need far less.
 MERGE_HEAP = os.environ.get("GB_CGAZ_MERGE_HEAP", "32gb")
+COUNTRY_HEAP = os.environ.get("GB_CGAZ_COUNTRY_HEAP", "8gb")
 
-logger = logging.getLogger(__name__)
+# Share of removable vertices kept when simplifying each country's ADM1/ADM2
+# before it's clipped to LSIB.  Same as the 2021 build.
+SIMPLIFY_PERCENTAGE = "0.10"
 
+# Slivers between countries (where gbOpen and LSIB disagree) up to this size
+# are absorbed into a neighbouring shape during the merge.
+GAP_FILL_AREA = "10000km2"
 
-def cmd(command, **kwargs):
-    """Run a shell command with logging."""
-    logger.debug("Executing: %s", command)
-    r = run(
-        command, stdout=PIPE, stderr=PIPE, universal_newlines=True, shell=True, **kwargs
+OUTPUT_DIR = TMP_DIR / "CGAZ"
+
+# ---------------------------------------------------------------------------
+# PostGIS schema
+# ---------------------------------------------------------------------------
+
+SCHEMA = [
+    """
+    CREATE TABLE IF NOT EXISTS cgaz_lsib (
+        id SERIAL PRIMARY KEY,
+        iso TEXT,
+        name TEXT,
+        disputed BOOLEAN NOT NULL,
+        geom geometry(Geometry, 4326)
     )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_cgaz_lsib_iso ON cgaz_lsib (iso)",
+    """
+    CREATE TABLE IF NOT EXISTS cgaz_parts (
+        id SERIAL PRIMARY KEY,
+        iso TEXT NOT NULL,
+        adm_level TEXT NOT NULL,
+        shape_name TEXT,
+        shape_id TEXT,
+        shape_group TEXT,
+        shape_type TEXT,
+        geom geometry(Geometry, 4326)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_cgaz_parts_lookup ON cgaz_parts (adm_level, iso)",
+    """
+    CREATE TABLE IF NOT EXISTS cgaz_outputs (
+        key TEXT PRIMARY KEY,
+        size BIGINT NOT NULL
+    )
+    """,
+]
+
+
+def init_schema(conn):
+    """Create the CGAZ tables.  `conn` is a SQLAlchemy connection in a transaction."""
+    for statement in SCHEMA:
+        conn.execute(text(statement))
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _heap_mb(heap):
+    """Convert mapshaper-xl's "<n>gb" heap syntax to megabytes."""
+    return int(float(heap.lower().removesuffix("b").removesuffix("g")) * 1024)
+
+
+def mapshaper(*args, heap=None):
+    """Run mapshaper, raising if it fails.
+
+    Calls plain `mapshaper` with the heap set through NODE_OPTIONS rather
+    than going through `mapshaper-xl`, which always exits 0 (it never
+    forwards its child's exit code) and isn't the real script in the image.
+    """
+
+    env = None
+    if heap:
+        env = {**os.environ, "NODE_OPTIONS": f"--max-old-space-size={_heap_mb(heap)}"}
+    command = ["mapshaper", *map(str, args)]
+    log.debug("Running %s", " ".join(command))
+    r = subprocess.run(command, capture_output=True, text=True, env=env)
     if r.returncode != 0:
-        logger.error("Command failed (rc=%d): %s", r.returncode, command)
-        if r.stderr.strip():
-            logger.error("stderr: %s", r.stderr.strip())
+        raise RuntimeError(
+            f"mapshaper failed (rc={r.returncode}): {r.stderr.strip()[-2000:]}"
+        )
     return r
 
 
-def fetch_lsib(url):
-    """Download the LSIB file the build driver staged, and return its path."""
-    dest = TMP_DIR / LSIB_GEOJSON.name
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    logger.info("Downloading LSIB base layer to %s", dest)
+def _run(command):
+    """Run a non-mapshaper command (ogr2ogr), raising if it fails."""
+    log.debug("Running %s", " ".join(map(str, command)))
+    r = subprocess.run(list(map(str, command)), capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(
+            f"{command[0]} failed (rc={r.returncode}): {r.stderr.strip()[-2000:]}"
+        )
+    return r
+
+
+def _to_parts_frame(gdf):
+    """Normalise a frame read from GeoJSON to the PostGIS column layout."""
+    if gdf.geometry.name != "geom":
+        gdf = gdf.rename_geometry("geom")
+    if gdf.crs is None:
+        gdf = gdf.set_crs(epsg=4326)
+    return gdf
+
+
+def _download(url, dest):
     with requests.get(url, stream=True, timeout=60) as resp:
         resp.raise_for_status()
         with open(dest, "wb") as f:
             for chunk in resp.iter_content(chunk_size=1 << 20):
                 f.write(chunk)
-    return str(dest)
 
 
-def preprocess_dta():
-    """Preprocess the data by separating disputed regions, renaming countries, and adding ISO codes."""
-    logger.info("Dissolving geometries based on ISO codes...")
-    globalDta = gpd.read_file(stdGeom)
-    isoCSV = pd.read_csv(stdISO)
+# ---------------------------------------------------------------------------
+# LSIB base layer (Dask task, once per run)
+# ---------------------------------------------------------------------------
 
-    # Separate disputedG regions.
-    # All disputedG regions will be assigned to a "Disputed" set of regions, burned in at the end.
-    disputedG = globalDta[globalDta["COUNTRY_NA"].str.contains("(disp)")].copy()
-    G = globalDta[~globalDta["COUNTRY_NA"].str.contains("(disp)")].copy()
+# LSIB names territories after their administering country.  CGAZ folds
+# them into that country; the first marker found in the name wins.
+TERRITORY_PARENTS = {
+    "(US)": "United States",
+    "(UK)": "United Kingdom",
+    "(Aus)": "Australia",
+    "Greenland (Den)": "Greenland",
+    "(Den)": "Denmark",
+    "(Fr)": "France",
+    "(Ch)": "China",
+    "(Nor)": "Norway",
+    "(NZ)": "New Zealand",
+    "Netherlands [Caribbean]": "Netherlands",
+    "(Neth)": "Netherlands",
+    "Portugal [": "Portugal",
+    "Spain [": "Spain",
+}
 
-    # For CGAZ, all territories are merged into their parent country.
-    # Cleanup country names in DoS cases
-    def country_renamer(country_na: str):
-        test_dict = {
-            "(US)": "United States",
-            "(UK)": "United Kingdom",
-            "(Aus)": "Australia",
-            "Greenland (Den)": "Greenland",
-            "(Den)": "Denmark",
-            "(Fr)": "France",
-            "(Ch)": "China",
-            "(Nor)": "Norway",
-            "(NZ)": "New Zealand",
-            "Netherlands [Caribbean]": "Netherlands",
-            "(Neth)": "Netherlands",
-            "Portugal [": "Portugal",
-            "Spain [": "Spain",
-        }
+# LSIB country names that don't match a name in dta/iso_3166_1_alpha_3.csv.
+LSIB_ISO_OVERRIDES = {
+    "Antigua & Barbuda": "ATG",
+    "Bahamas, The": "BHS",
+    "Bosnia & Herzegovina": "BIH",
+    "Congo, Dem Rep of the": "COD",
+    "Congo, Rep of the": "COG",
+    "Cabo Verde": "CPV",
+    "Cote d'Ivoire": "CIV",
+    "Central African Rep": "CAF",
+    "Czechia": "CZE",
+    "Gambia, The": "GMB",
+    "Iran": "IRN",
+    "Korea, North": "PRK",
+    "Korea, South": "KOR",
+    "Laos": "LAO",
+    "Macedonia": "MKD",
+    "Marshall Is": "MHL",
+    "Micronesia, Fed States of": "FSM",
+    "Moldova": "MDA",
+    "Sao Tome & Principe": "STP",
+    "Solomon Is": "SLB",
+    "St Kitts & Nevis": "KNA",
+    "St Lucia": "LCA",
+    "St Vincent & the Grenadines": "VCT",
+    "Syria": "SYR",
+    "Tanzania": "TZA",
+    "Vatican City": "VAT",
+    "United States": "USA",
+    "Antarctica": "ATA",
+    "Bolivia": "BOL",
+    "Brunei": "BRN",
+    "Russia": "RUS",
+    "Trinidad & Tobago": "TTO",
+    "Swaziland": "SWZ",
+    "Venezuela": "VEN",
+    "Vietnam": "VNM",
+    "Burma": "MMR",
+}
 
-        default = [country_na]
-        country_na = [v for k, v in test_dict.items() if k in country_na] + default
-        return country_na[0]
 
-    G.COUNTRY_NA = G.COUNTRY_NA.map(country_renamer)
+def parent_country(name):
+    """Map an LSIB territory name to the country CGAZ folds it into."""
+    for marker, parent in TERRITORY_PARENTS.items():
+        if marker in name:
+            return parent
+    return name
 
-    # Add ISO codes
 
-    # Need to just do a list at some point.
-    # Don't want to change the underlying data is the challenge.
-    def isoLookup(country):
-        try:
-            switcher = {
-                "Antigua & Barbuda": "ATG",
-                "Bahamas, The": "BHS",
-                "Bosnia & Herzegovina": "BIH",
-                "Congo, Dem Rep of the": "COD",
-                "Congo, Rep of the": "COG",
-                "Cabo Verde": "CPV",
-                "Cote d'Ivoire": "CIV",
-                "Central African Rep": "CAF",
-                "Czechia": "CZE",
-                "Gambia, The": "GMB",
-                "Iran": "IRN",
-                "Korea, North": "PRK",
-                "Korea, South": "KOR",
-                "Laos": "LAO",
-                "Macedonia": "MKD",
-                "Marshall Is": "MHL",
-                "Micronesia, Fed States of": "FSM",
-                "Moldova": "MDA",
-                "Sao Tome & Principe": "STP",
-                "Solomon Is": "SLB",
-                "St Kitts & Nevis": "KNA",
-                "St Lucia": "LCA",
-                "St Vincent & the Grenadines": "VCT",
-                "Syria": "SYR",
-                "Tanzania": "TZA",
-                "Vatican City": "VAT",
-                "United States": "USA",
-                "Antarctica": "ATA",
-                "Bolivia": "BOL",
-                "Brunei": "BRN",
-                "Russia": "RUS",
-                "Trinidad & Tobago": "TTO",
-                "Swaziland": "SWZ",
-                "Venezuela": "VEN",
-                "Vietnam": "VNM",
-                "Burma": "MMR",
-            }
+def iso_tables():
+    """Return ({CSV name: ISO code}, {ISO code: CSV name}).
 
-            # First try to find the country in the CSV
-            isoCSV_match = isoCSV[isoCSV["Name"] == country]
-            if len(isoCSV_match) == 1:
-                isoCSV_match = isoCSV_match["Alpha-3code"].values[0]
-                logger.debug(
-                    f"Found ISO code in CSV: {isoCSV_match} for country: {country}"
-                )
-                return isoCSV_match
+    Names that appear more than once in the CSV are left out of the first
+    table, so they fall through to LSIB_ISO_OVERRIDES.
+    """
+    iso_df = pd.read_csv(ISO_CSV)
+    counts = iso_df["Name"].value_counts()
+    unique = iso_df[iso_df["Name"].map(counts) == 1]
+    codes = dict(zip(unique["Name"], unique["Alpha-3code"]))
+    names = dict(zip(iso_df["Alpha-3code"], iso_df["Name"]))
+    return codes, names
 
-            # If not found in CSV, try the switcher dictionary
-            switcher_match = switcher.get(country)
-            if switcher_match:
-                logger.debug(
-                    f"Using switcher match: {switcher_match} for country: {country}"
-                )
-                return switcher_match
 
-            logger.warning(f"No ISO code found for country: {country}")
-            return None
+def split_lsib(lsib, codes):
+    """Split raw LSIB features into countries and disputed areas.
 
-        except Exception as e:
-            logger.error(
-                f"Error in isoLookup for country {country}: {str(e)}", exc_info=True
+    Both frames come back with `name`, `iso` and `key` (what to dissolve
+    on) columns.  Territories take their parent country's name.  Disputed
+    areas keep their own name minus " (disp)", and get an ISO code only
+    when that name is itself a country (e.g. Western Sahara).
+    """
+
+    is_disputed = lsib["COUNTRY_NA"].str.contains("(disp)", regex=False)
+
+    countries = lsib[~is_disputed].copy()
+    countries["name"] = countries["COUNTRY_NA"].map(parent_country)
+    disputed = lsib[is_disputed].copy()
+    disputed["name"] = disputed["COUNTRY_NA"].str.replace(" (disp)", "", regex=False)
+
+    for gdf in (countries, disputed):
+        gdf["iso"] = gdf["name"].map(
+            lambda n: codes.get(n) or LSIB_ISO_OVERRIDES.get(n)
+        )
+
+    unmatched = sorted(countries.loc[countries["iso"].isna(), "name"].unique())
+    if unmatched:
+        # Kept, so they still cover their land in every layer, just without
+        # an ISO code.  Add them to LSIB_ISO_OVERRIDES to fix.
+        log.warning("LSIB countries with no ISO code: %s", ", ".join(unmatched))
+
+    # Countries without a code dissolve by name so they don't merge together.
+    countries["key"] = countries["iso"].fillna(countries["name"])
+    disputed["key"] = disputed["name"]
+
+    columns = ["key", "name", "iso", "geometry"]
+    return countries[columns], disputed[columns]
+
+
+def prepare_lsib(lsib_url, db_url):
+    """Dask task: load the LSIB base layer into `cgaz_lsib`.
+
+    Returns a result dict with "status" ("ok" or "error"); every
+    build_cgaz_country task waits on it.
+    """
+
+    t0 = time.perf_counter()
+    result = {"task": "lsib"}
+    tmpdir = Path(tempfile.mkdtemp(prefix="gb-cgaz-lsib-"))
+    engine = create_engine(db_url)
+    try:
+        raw = tmpdir / "lsib.geojson"
+        _download(lsib_url, raw)
+        codes, names = iso_tables()
+        countries, disputed = split_lsib(gpd.read_file(raw), codes)
+        raw.unlink()
+
+        frames = []
+        for kind, gdf in (("countries", countries), ("disputed", disputed)):
+            src = tmpdir / f"{kind}.geojson"
+            out = tmpdir / f"{kind}-dissolved.geojson"
+            gdf.to_file(src, driver="GeoJSON")
+            mapshaper(
+                src,
+                "-dissolve",
+                "fields=key",
+                "copy-fields=name,iso",
+                "multipart",
+                "-o",
+                "format=geojson",
+                out,
+                heap=COUNTRY_HEAP,
             )
-            return None
+            dissolved = gpd.read_file(out)
+            dissolved["disputed"] = kind == "disputed"
+            frames.append(dissolved)
 
-    G["ISO_CODE"] = G.COUNTRY_NA.map(isoLookup)
+        lsib = _to_parts_frame(gpd.GeoDataFrame(pd.concat(frames, ignore_index=True)))
+        # Countries are named as in the ISO CSV, like the rest of geoBoundaries.
+        is_country = ~lsib["disputed"] & lsib["iso"].notna()
+        lsib.loc[is_country, "name"] = (
+            lsib.loc[is_country, "iso"].map(names).fillna(lsib.loc[is_country, "name"])
+        )
+        lsib = lsib[["iso", "name", "disputed", "geom"]]
 
-    # check for nulls in ISO_CODE
-    features_without_iso_code = G[G.ISO_CODE.isna() | G.ISO_CODE == ""]
-    if len(features_without_iso_code) > 0:
-        print("Error - no match.")
-        print(features_without_iso_code)
-        sys.exit(1)
+        # Replace rather than append, so a retried task doesn't double up.
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM cgaz_lsib"))
+            lsib.to_postgis("cgaz_lsib", conn, if_exists="append", index=False)
 
-    disputedG.COUNTRY_NA = disputedG.COUNTRY_NA.str.replace(" (disp)", "", regex=False)
-    disputedG["ISO_CODE"] = disputedG.COUNTRY_NA.map(isoLookup)
-    disputedG[disputedG.ISO_CODE.isna() | disputedG.ISO_CODE == ""].ISO_CODE = "None"
-
-    os.makedirs(outPath, exist_ok=True)
-    G.to_file(os.path.join(outPath, "baseISO.geojson"), driver="GeoJSON")
-    disputedG.to_file(os.path.join(outPath, "disputedISO.geojson"), driver="GeoJSON")
-
-
-def process_geometry_wrapper(args, adm0):
-    """Wrapper function to handle logging and exceptions for parallel processing."""
-    try:
-        logger.info(f"Starting processing for ADM0: {adm0}")
-        # Initialize empty strings for this process
-        adm0str, adm1str, adm2str = process_geometry(args, adm0, "", "", "")
-        logger.info(f"Completed processing for ADM0: {adm0}")
-        return {
-            "adm0": adm0,
-            "adm0str": adm0str,
-            "adm1str": adm1str,
-            "adm2str": adm2str,
-            "success": True,
-        }
+        result.update(
+            status="ok",
+            countries=int((~lsib["disputed"]).sum()),
+            disputed=int(lsib["disputed"].sum()),
+        )
+        log.info(
+            "Loaded LSIB: %d countries, %d disputed areas",
+            result["countries"],
+            result["disputed"],
+        )
     except Exception as e:
-        logger.error(f"Error processing ADM0 {adm0}: {str(e)}", exc_info=True)
-        return {"adm0": adm0, "error": str(e), "success": False}
+        log.exception("LSIB preparation failed")
+        result.update(status="error", error=str(e))
+    finally:
+        engine.dispose()
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        result["timings"] = {"total": round(time.perf_counter() - t0, 1)}
+    return result
 
 
-def process_geometries(args):
-    """Process geometries for all ADM0 regions in parallel."""
+# ---------------------------------------------------------------------------
+# Per-country parts (Dask task, one per gbOpen ISO)
+# ---------------------------------------------------------------------------
+
+
+def cgaz_sources(ok_levels):
+    """Pick the gbOpen level each CGAZ level of a country is cut from.
+
+    Missing levels fall back up the hierarchy, ADM2 -> ADM1 -> ADM0, so the
+    world has no holes.  None means the country has no usable gbOpen
+    boundary, and the merge uses its LSIB outline instead.
+    """
+    adm1 = next((level for level in ("ADM1", "ADM0") if level in ok_levels), None)
+    adm2 = "ADM2" if "ADM2" in ok_levels else adm1
+    return {"ADM1": adm1, "ADM2": adm2}
+
+
+def _clip_boundary(engine, iso, adm, outline_path, workdir):
+    """Simplify one gbOpen boundary and clip it to the LSIB country outline."""
+
+    gdf = gpd.read_postgis(
+        text(
+            "SELECT shape_name, shape_id, shape_group, shape_type, geom "
+            "FROM boundaries "
+            "WHERE product = 'gbOpen' AND iso = :iso AND adm_level = :adm"
+        ),
+        engine,
+        geom_col="geom",
+        params={"iso": iso, "adm": adm},
+    )
+    if gdf.empty:
+        return gdf
+
+    src = workdir / f"{adm}.geojson"
+    out = workdir / f"{adm}-clipped.geojson"
+    gdf.to_file(src, driver="GeoJSON")
+    mapshaper(
+        src,
+        "-simplify",
+        "keep-shapes",
+        f"percentage={SIMPLIFY_PERCENTAGE}",
+        "-clip",
+        outline_path,
+        "-o",
+        "format=geojson",
+        out,
+        heap=COUNTRY_HEAP,
+    )
+    return _to_parts_frame(gpd.read_file(out))
+
+
+def build_cgaz_country(iso, db_url, lsib, *builds):
+    """Dask task: write one country's clipped ADM1/ADM2 to `cgaz_parts`.
+
+    `lsib` and `builds` are the results of prepare_lsib and of this
+    country's gbOpen ADM0-2 builds.  Passing them as arguments makes Dask
+    hold this task until they're all done; only levels that built
+    successfully this run are used.
+    """
+
+    t0 = time.perf_counter()
+    result = {"task": "country", "iso": iso}
+    if lsib.get("status") != "ok":
+        result.update(status="error", error="LSIB base layer failed to load")
+        result["timings"] = {"total": 0.0}
+        return result
+
+    sources = cgaz_sources({b["adm"] for b in builds if b.get("status") == "ok"})
+    result["sources"] = sources
+    tmpdir = Path(tempfile.mkdtemp(prefix=f"gb-cgaz-{iso}-"))
+    engine = create_engine(db_url)
     try:
-        logger.info("Starting process_geometries")
-        logger.info("Loading base ISO geometries")
+        outline = gpd.read_postgis(
+            text("SELECT geom FROM cgaz_lsib WHERE iso = :iso AND NOT disputed"),
+            engine,
+            geom_col="geom",
+            params={"iso": iso},
+        )
+        if outline.empty:
+            # CGAZ is laid out on LSIB countries, so there's nowhere to put it.
+            result.update(status="skipped", reason="not an LSIB country")
+            return result
+        outline_path = tmpdir / "outline.geojson"
+        outline.to_file(outline_path, driver="GeoJSON")
 
-        # Load the base ISO file
-        base_iso_path = f"{outPath}baseISO.geojson"
-        logger.info(f"Loading base ISO file from: {base_iso_path}")
+        clipped = {}
+        parts = []
+        empty = []
+        for level, source in sources.items():
+            if source is None:
+                continue
+            if source not in clipped:
+                clipped[source] = _clip_boundary(
+                    engine, iso, source, outline_path, tmpdir
+                )
+            if clipped[source].empty:
+                empty.append(level)
+                continue
+            part = clipped[source].copy()
+            part["iso"] = iso
+            part["adm_level"] = level
+            parts.append(part)
 
-        if not os.path.exists(base_iso_path):
-            error_msg = f"Base ISO file not found at: {base_iso_path}"
-            logger.error(error_msg)
-            raise FileNotFoundError(error_msg)
+        # Replace rather than append, so a retried task doesn't double up.
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM cgaz_parts WHERE iso = :iso"), {"iso": iso})
+            for part in parts:
+                part.to_postgis("cgaz_parts", conn, if_exists="append", index=False)
 
-        G = gpd.read_file(base_iso_path)
-        logger.info(f"Successfully loaded base ISO file with {len(G)} records")
-
-        # Create a list of all the ADM0s
-        adm0s = [x for x in G.ISO_CODE.unique() if x is not None]
-        logger.info(f"Found {len(adm0s)} unique ADM0 regions to process: {adm0s}")
-
-        # Initialize result accumulators
-        all_adm0str = []
-        all_adm1str = []
-        all_adm2str = []
-        failed_adm0s = []
-
-        # Process ADM0s in parallel
-        with ProcessPoolExecutor(max_workers=10) as executor:
-            # Submit all tasks
-            future_to_adm0 = {
-                executor.submit(process_geometry_wrapper, args, adm0): adm0
-                for adm0 in adm0s
-            }
-
-            # Process results as they complete
-            for future in as_completed(future_to_adm0):
-                adm0 = future_to_adm0[future]
-                try:
-                    result = future.result()
-                    if result["success"]:
-                        all_adm0str.append(result["adm0str"])
-                        all_adm1str.append(result["adm1str"])
-                        all_adm2str.append(result["adm2str"])
-                        logger.info(f"Successfully processed {adm0}")
-                    else:
-                        failed_adm0s.append(adm0)
-                        logger.error(
-                            f"Failed to process {adm0}: {result.get('error', 'Unknown error')}"
-                        )
-                except Exception as e:
-                    failed_adm0s.append(adm0)
-                    logger.error(f"Exception processing {adm0}: {str(e)}")
-
-        # Log summary
-        if failed_adm0s:
-            logger.warning(
-                f"Failed to process {len(failed_adm0s)}/{len(adm0s)} ADM0 regions: {failed_adm0s}"
+        if empty:
+            # The merge falls back to the LSIB outline for these levels.
+            result["empty_levels"] = empty
+            log.warning(
+                "CGAZ/%s: %s came out empty after clipping to LSIB",
+                iso,
+                ", ".join(empty),
             )
-        else:
-            logger.info("Successfully processed all ADM0 regions")
-
-        # Combine all results
-        return "".join(all_adm0str), "".join(all_adm1str), "".join(all_adm2str)
-
+        result["status"] = "ok"
     except Exception as e:
-        logger.critical(f"Script failed: {str(e)}\n{traceback.format_exc()}")
-        sys.exit(1)
+        log.exception("CGAZ/%s failed", iso)
+        result.update(status="error", error=str(e))
+    finally:
+        engine.dispose()
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        result["timings"] = {"total": round(time.perf_counter() - t0, 1)}
+    return result
 
 
-def process_geometry(args, adm0, adm0str, adm1str, adm2str):
-    """Process geometry for a single ADM0 region."""
-    logger.info(f"Starting process_geometry for ADM0: {adm0}")
-
-    try:
-        logger.debug(f"Processing ADM0: {adm0}")
-        curISO = adm0
-
-        # Load the base ISO file to get the geometry for this ADM0
-        base_iso_path = f"{outPath}baseISO.geojson"
-        logger.debug(f"Loading base ISO file for {curISO} from: {base_iso_path}")
-
-        if not os.path.exists(base_iso_path):
-            error_msg = f"Base ISO file not found at: {base_iso_path}"
-            logger.error(error_msg)
-            raise FileNotFoundError(error_msg)
-
-        G = gpd.read_file(base_iso_path)
-        logger.debug(f"Loaded base ISO file with {len(G)} records")
-
-        # Filter for the current ISO
-        g = G[G["ISO_CODE"] == curISO]
-        if g.empty:
-            error_msg = f"No data found for ISO code: {curISO}"
-            logger.error(error_msg)
-            raise ValueError(error_msg)
-
-        logger.debug(f"Found {len(g)} records for ISO: {curISO}")
-
-        if g.empty:
-            logger.warning(f"No geometry found for ISO code: {curISO}")
-            return adm0str, adm1str, adm2str
-
-        # Save ADM0 geometry
-        DTA_A0Path = os.path.join(outPath, f"ADM0_{curISO}.geojson")
-        g.to_file(DTA_A0Path, driver="GeoJSON")
-        # Process additional boundary files from geoBoundaries
-        A0Path = os.path.join(
-            gBPath, curISO, "ADM0", f"geoBoundaries-{curISO}-ADM0.geojson"
-        )
-        A1Path = os.path.join(
-            gBPath, curISO, "ADM1", f"geoBoundaries-{curISO}-ADM1.geojson"
-        )
-        A2Path = os.path.join(
-            gBPath, curISO, "ADM2", f"geoBoundaries-{curISO}-ADM2.geojson"
-        )
-
-        logger.debug(f"ADM0 Path: {A0Path}")
-        logger.debug(f"ADM1 Path: {A1Path}")
-        logger.debug(f"ADM2 Path: {A2Path}")
-
-        # Fall back to higher admin levels if needed
-        if not os.path.isfile(A1Path):
-            A1Path = A0Path
-        if not os.path.isfile(A2Path):
-            A2Path = A1Path
-
-        # Generate output paths for GeoJSON
-        adm1out = os.path.join(outPath, f"ADM1_{curISO}.geojson")
-        adm2out = os.path.join(outPath, f"ADM2_{curISO}.geojson")
-
-        # Process with mapshaper if input files exist
-        if os.path.isfile(A1Path):
-            cmd(f"mapshaper-xl {A1Path} -o format=geojson {adm1out}")
-            adm1str += " " + adm1out
-
-        if os.path.isfile(A2Path):
-            cmd(f"mapshaper-xl {A2Path} -o format=geojson {adm2out}")
-            adm2str += " " + adm2out
-
-        adm0str += " " + DTA_A0Path
-        logger.debug(f"Completed processing ADM0: {adm0}")
-        return adm0str, adm1str, adm2str
-
-    except Exception as e:
-        logger.error(f"Error processing ADM0 {adm0}: {str(e)}", exc_info=True)
-        return adm0str, adm1str, adm2str
+# ---------------------------------------------------------------------------
+# Global merge (Kubernetes Job)
+# ---------------------------------------------------------------------------
 
 
-def load_iso_name_lookup():
-    """Load ISO code to country name mapping from CSV."""
-    iso_lookup = {}
-    try:
-        iso_df = pd.read_csv(str(ISO_CSV))
-        iso_lookup = dict(zip(iso_df["Alpha-3code"], iso_df["Name"]))
-        logger.debug(f"Loaded ISO name lookup with {len(iso_lookup)} entries")
-    except Exception as e:
-        logger.error(f"Error loading ISO name lookup: {str(e)}")
-    return iso_lookup
+def level_sql(level):
+    """SQL for every shape in one global CGAZ layer.
+
+    That's the country parts cut for this level, then the LSIB outline of
+    every country without parts (no gbOpen data, a failed build, or ADM0),
+    then the disputed areas.
+    """
+    if level not in LEVELS:
+        raise ValueError(f"Unknown CGAZ level {level!r}")
+    return f"""
+        SELECT shape_name AS "shapeName", shape_id AS "shapeID",
+               shape_group AS "shapeGroup", shape_type AS "shapeType", geom
+          FROM cgaz_parts
+         WHERE adm_level = '{level}'
+        UNION ALL
+        SELECT name, iso, iso, 'ADM0', geom
+          FROM cgaz_lsib l
+         WHERE NOT disputed
+           AND NOT EXISTS (
+               SELECT 1 FROM cgaz_parts p
+                WHERE p.adm_level = '{level}' AND p.iso = l.iso
+           )
+        UNION ALL
+        SELECT name, NULL, iso, 'Disputed', geom
+          FROM cgaz_lsib
+         WHERE disputed
+    """
 
 
-# Lazy-loaded cache — avoids file I/O at import time
-_ISO_NAME_LOOKUP = None
-
-
-def get_iso_name_lookup():
-    """Return the cached ISO name lookup, loading on first call."""
-    global _ISO_NAME_LOOKUP
-    if _ISO_NAME_LOOKUP is None:
-        _ISO_NAME_LOOKUP = load_iso_name_lookup()
-    return _ISO_NAME_LOOKUP
-
-
-def filter_attributes(gdf, adm_level):
-    """Filter GeoDataFrame to only include required attributes."""
-    required_columns = {
-        "geometry",  # Keep geometry column
-        "shapeName",
-        "shapeID",
-        "shapeGroup",
-        "shapeType",
+def pg_conninfo(db_url):
+    """Turn a SQLAlchemy URL into the libpq conninfo string GDAL expects."""
+    url = make_url(db_url)
+    parts = {
+        "dbname": url.database,
+        "host": url.host,
+        "port": url.port,
+        "user": url.username,
+        "password": url.password,
     }
-
-    # Create a copy to avoid SettingWithCopyWarning
-    result = gdf.copy()
-
-    # Set shapeID first as it's used for the name lookup
-    if "shapeID" not in result.columns:
-        result["shapeID"] = result.get("GID_0", result.get("ISO_CODE", ""))
-
-    # Handle shapeName based on ADM level
-    if "shapeName" not in result.columns:
-        if adm_level == "ADM0":
-            # For ADM0, use the ISO name lookup
-            result["shapeName"] = (
-                result["shapeID"].map(get_iso_name_lookup()).fillna("")
-            )
-            # Fallback to original name if lookup fails
-            if result["shapeName"].empty or result["shapeName"].isna().all():
-                result["shapeName"] = result.get("NAME_0", result.get("NAME", ""))
-        else:
-            # For ADM1/ADM2, use existing name fields
-            result["shapeName"] = result.get(
-                "NAME_1", result.get("NAME_2", result.get("NAME", ""))
-            )
-
-    # Set shapeGroup if not present
-    if "shapeGroup" not in result.columns:
-        result["shapeGroup"] = result["shapeID"]
-
-    # Set shapeType
-    if "shapeType" not in result.columns:
-        result["shapeType"] = adm_level
-
-    # Keep only required columns
-    columns_to_keep = [col for col in result.columns if col in required_columns]
-    return result[columns_to_keep]
+    return "PG:" + " ".join(f"{k}='{v}'" for k, v in parts.items() if v is not None)
 
 
-def merge_cmd(command):
-    """Run a global mapshaper merge, failing loudly if it doesn't finish."""
-    r = cmd(command)
-    if r.returncode != 0:
-        raise RuntimeError(f"mapshaper merge failed (rc={r.returncode})")
+def merge_level(db_url, level, workdir, out_dir):
+    """Build the GeoJSON, GeoPackage and zipped Shapefile for one level."""
 
+    name = f"geoBoundariesCGAZ_{level}"
+    raw = workdir / f"{name}-raw.geojson"
+    geojson = out_dir / f"{name}.geojson"
 
-def join_admins(adm0str, adm1str, adm2str):
-    """Join ADM levels and ensure only required attributes are kept."""
-    logger.debug("Joining ADM0 / ADM1 / ADM2s together into one large geom.")
-    logger.debug(f"ADM0: {adm0str}")
-    logger.debug(f"ADM1: {adm1str}")
-    logger.debug(f"ADM2: {adm2str}")
-
-    A0mapShaperFull = (
-        f"mapshaper-xl {MERGE_HEAP} -i "
-        + adm0str
-        + " "
-        + outPath
-        + "disputedISO.geojson"
-        + " combine-files -merge-layers force"
-        + " name=globalADM0"
-        +
-        # " -simplify weighted " + ratio + "% keep-shapes" +
-        " -clean gap-fill-area=10000km2"
-        + " -o format=topojson "
-        + (outPath + "geoBoundariesCGAZ_ADM0.topojson")
-        + " -o format=geojson "
-        + (outPath + "geoBoundariesCGAZ_ADM0.geojson")
-        + " -o format=shapefile "
-        + (outPath + "geoBoundariesCGAZ_ADM0.shp")
-    )
-    A1mapShaperFull = (
-        f"mapshaper-xl {MERGE_HEAP} -i "
-        + adm1str
-        + " "
-        + outPath
-        + "disputedISO.geojson"
-        + " combine-files -merge-layers force"
-        + " name=globalADM1"
-        +
-        # " -simplify weighted " + ratio + "% keep-shapes" +
-        " -clean gap-fill-area=10000km2"
-        + " -o format=topojson "
-        + (outPath + "geoBoundariesCGAZ_ADM1.topojson")
-        + " -o format=geojson "
-        + (outPath + "geoBoundariesCGAZ_ADM1.geojson")
-        + " -o format=shapefile "
-        + (outPath + "geoBoundariesCGAZ_ADM1.shp")
-    )
-    A2mapShaperFull = (
-        f"mapshaper-xl {MERGE_HEAP} -i "
-        + adm2str
-        + " "
-        + outPath
-        + "disputedISO.geojson"
-        + " combine-files -merge-layers force"
-        + " name=globalADM2"
-        +
-        # " -simplify weighted " + ratio + "% keep-shapes" +
-        " -clean gap-fill-area=10000km2"
-        + " -o format=topojson "
-        + (outPath + "geoBoundariesCGAZ_ADM2.topojson")
-        + " -o format=geojson "
-        + (outPath + "geoBoundariesCGAZ_ADM2.geojson")
-        + " -o format=shapefile "
-        + (outPath + "geoBoundariesCGAZ_ADM2.shp")
+    # ogr2ogr streams the layer out of PostGIS instead of holding it in Python.
+    log.info("%s: exporting from PostGIS", level)
+    _run(
+        ["ogr2ogr", "-f", "GeoJSON", raw, pg_conninfo(db_url), "-sql", level_sql(level)]
     )
 
-    def generate_output_formats(adm_level):
-        """Generate GeoPackage and Shapefile from the final GeoJSON."""
-        geojson_path = f"{outPath}geoBoundariesCGAZ_{adm_level}.geojson"
-        gpkg_path = f"{outPath}geoBoundariesCGAZ_{adm_level}.gpkg"
-        shp_path = f"{outPath}geoBoundariesCGAZ_{adm_level}"
-
-        # Read the final GeoJSON
-        gdf = gpd.read_file(geojson_path)
-
-        # Save as GeoPackage
-        gdf.to_file(gpkg_path, driver="GPKG")
-        logger.info(f"Generated GeoPackage: {gpkg_path}")
-
-        # Save as Shapefile
-        gdf.to_file(f"{shp_path}.shp", driver="ESRI Shapefile")
-        logger.info(f"Generated Shapefile: {shp_path}.shp")
-
-        # Create zip of shapefile components
-        with zipfile.ZipFile(f"{shp_path}.zip", "w", zipfile.ZIP_DEFLATED) as zipf:
-            for ext in [".shp", ".shx", ".dbf", ".prj"]:
-                file_path = f"{shp_path}{ext}"
-                if os.path.exists(file_path):
-                    zipf.write(file_path, os.path.basename(file_path))
-        logger.info(f"Created shapefile zip: {shp_path}.zip")
-
-    # Process ADM0 with mapshaper
-    logger.info("Starting ADM0 mapshaper processing...")
-    logger.info(A0mapShaperFull)
-    merge_cmd(A0mapShaperFull)
-
-    # Process ADM1 with mapshaper
-    logger.info("Starting ADM1 mapshaper processing...")
-    logger.info(A1mapShaperFull)
-    merge_cmd(A1mapShaperFull)
-
-    # Process ADM2 with mapshaper
-    logger.info("Starting ADM2 mapshaper processing...")
-    logger.info(A2mapShaperFull)
-    merge_cmd(A2mapShaperFull)
-
-    # Now process each ADM level to generate final outputs
-    for adm_level in ["ADM0", "ADM1", "ADM2"]:
-        logger.info(f"Processing final outputs for {adm_level}...")
-
-        # Read the TopoJSON output from mapshaper
-        topojson_path = f"{outPath}geoBoundariesCGAZ_{adm_level}.topojson"
-        gdf = gpd.read_file(topojson_path)
-
-        # Filter attributes
-        filtered_gdf = filter_attributes(gdf, adm_level)
-
-        # Save as GeoJSON (our source of truth)
-        geojson_path = f"{outPath}geoBoundariesCGAZ_{adm_level}.geojson"
-        filtered_gdf.to_file(geojson_path, driver="GeoJSON")
-        logger.info(f"Generated final GeoJSON: {geojson_path}")
-
-        # Generate other formats from the GeoJSON
-        generate_output_formats(adm_level)
-
-        logger.info(f"Completed processing for {adm_level}")
-
-    # Clean up intermediate TopoJSON files
-    for adm_level in ["ADM0", "ADM1", "ADM2"]:
-        topojson_path = f"{outPath}geoBoundariesCGAZ_{adm_level}.topojson"
-        if os.path.exists(topojson_path):
-            os.remove(topojson_path)
-            logger.debug(f"Cleaned up intermediate file: {topojson_path}")
-
-
-def dissolve_based_on_ISO_Code():
-    base_in = os.path.join(outPath, "baseISO.geojson")
-    disp_in = os.path.join(outPath, "disputedISO.geojson")
-    cmd(
-        f"mapshaper-xl {base_in} -dissolve fields='ISO_CODE' multipart -o force format=geojson {base_in}"
+    log.info("%s: merging with mapshaper", level)
+    mapshaper(
+        raw,
+        "-clean",
+        f"gap-fill-area={GAP_FILL_AREA}",
+        "-o",
+        "format=geojson",
+        geojson,
+        heap=MERGE_HEAP,
     )
-    cmd(
-        f"mapshaper-xl {disp_in} -dissolve fields='ISO_CODE' multipart -o format=geojson {disp_in}"
+    raw.unlink()
+
+    _run(["ogr2ogr", "-f", "GPKG", out_dir / f"{name}.gpkg", geojson])
+
+    shp_dir = workdir / f"{name}-shp"
+    shp_dir.mkdir()
+    _run(
+        [
+            "ogr2ogr",
+            "-f",
+            "ESRI Shapefile",
+            "-lco",
+            "ENCODING=UTF-8",
+            shp_dir / f"{name}.shp",
+            geojson,
+        ]
     )
+    with zipfile.ZipFile(out_dir / f"{name}.zip", "w", zipfile.ZIP_DEFLATED) as zf:
+        for part in sorted(shp_dir.iterdir()):
+            zf.write(part, part.name)
+    shutil.rmtree(shp_dir)
+    log.info("%s: done", level)
 
 
-def package_final_outputs():
-    """Package and copy final output files to the CGAZ output directory."""
+def merge(db_url, s3_config):
+    """Build every global layer and upload it.  Returns the upload manifest."""
+
+    engine = create_engine(db_url)
     try:
-        logger.info("Starting to package final outputs...")
+        with engine.connect() as conn:
+            countries = conn.execute(
+                text("SELECT count(*) FROM cgaz_lsib WHERE NOT disputed")
+            ).scalar()
+            parts = dict(
+                conn.execute(
+                    text(
+                        "SELECT adm_level, count(DISTINCT iso) "
+                        "FROM cgaz_parts GROUP BY adm_level"
+                    )
+                ).all()
+            )
+        if not countries:
+            raise RuntimeError("cgaz_lsib is empty; the LSIB task didn't load it")
+        for level in LEVELS[1:]:
+            log.info(
+                "%s: %d of %d countries have gbOpen parts; the rest use LSIB outlines",
+                level,
+                parts.get(level, 0),
+                countries,
+            )
 
-        # Ensure output directory exists
-        os.makedirs(CGAZOutputPath, exist_ok=True)
+        # Start clean: everything in OUTPUT_DIR gets uploaded.
+        shutil.rmtree(OUTPUT_DIR, ignore_errors=True)
+        out_dir = OUTPUT_DIR / "out"
+        workdir = OUTPUT_DIR / "work"
+        out_dir.mkdir(parents=True)
+        workdir.mkdir()
+        for level in LEVELS:
+            merge_level(db_url, level, workdir, out_dir)
 
-        for adm_level in ["ADM0", "ADM1", "ADM2"]:
-            # Base filenames
-            base_filename = f"geoBoundariesCGAZ_{adm_level}"
-            src_base = os.path.join(outPath, f"geoBoundariesCGAZ_{adm_level}")
+        if s3_config is None:
+            log.warning("S3 not configured; CGAZ outputs left in %s", out_dir)
+            return []
 
-            # 1. Copy GeoJSON
-            src_geojson = f"{src_base}.geojson"
-            dst_geojson = os.path.join(CGAZOutputPath, f"{base_filename}.geojson")
-            if os.path.exists(src_geojson):
-                shutil.copy2(src_geojson, dst_geojson)
-                logger.info(f"Copied {src_geojson} to {dst_geojson}")
-
-            # 2. Copy GeoPackage
-            src_gpkg = f"{src_base}.gpkg"
-            dst_gpkg = os.path.join(CGAZOutputPath, f"{base_filename}.gpkg")
-            if os.path.exists(src_gpkg):
-                shutil.copy2(src_gpkg, dst_gpkg)
-                logger.info(f"Copied {src_gpkg} to {dst_gpkg}")
-
-            # 3. Create zip with shapefile components
-            shapefile_components = [
-                f"{src_base}.{ext}" for ext in ["shp", "shx", "dbf", "prj"]
-            ]
-            if all(os.path.exists(f) for f in shapefile_components):
-                zip_path = os.path.join(CGAZOutputPath, base_filename)
-                with zipfile.ZipFile(
-                    f"{zip_path}.zip", "w", zipfile.ZIP_DEFLATED
-                ) as zipf:
-                    for file in shapefile_components:
-                        zipf.write(file, os.path.basename(file))
-                logger.info(f"Created zip file: {zip_path}.zip")
-
-        logger.info("Finished packaging all outputs")
-
-    except Exception as e:
-        logger.error(f"Error packaging final outputs: {str(e)}")
-        raise
+        manifest = upload_to_s3(out_dir, "CGAZ", s3_config)
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM cgaz_outputs"))
+            conn.execute(
+                text("INSERT INTO cgaz_outputs (key, size) VALUES (:key, :size)"),
+                manifest,
+            )
+        return manifest
+    finally:
+        engine.dispose()
 
 
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Process CGAZ boundaries")
+def main():
+    parser = argparse.ArgumentParser(
+        description="Merge the per-country CGAZ parts in PostGIS into global layers"
+    )
     parser.add_argument(
         "-v", "--verbose", action="count", default=0, help="Increase verbosity"
     )
     args = parser.parse_args()
-
-    level = (
-        logging.WARNING
-        if args.verbose == 0
-        else (logging.INFO if args.verbose == 1 else logging.DEBUG)
-    )
+    level = [logging.WARNING, logging.INFO, logging.DEBUG][min(args.verbose, 2)]
     logging.basicConfig(
         level=level, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
 
+    version = os.environ.get("GB_RELEASE_VERSION", "nightly")
     try:
-        logger.info("Starting CGAZ boundary processing...")
-        # In the image dta/ only holds the LFS pointer, so the driver passes
-        # a URL for the real file. Without one, use dta/ as-is (local runs).
-        if os.environ.get("GB_LSIB_URL"):
-            stdGeom = fetch_lsib(os.environ["GB_LSIB_URL"])
-        preprocess_dta()
-        adm0str, adm1str, adm2str = process_geometries(args)
-        join_admins(adm0str, adm1str, adm2str)
-        package_final_outputs()
-        logger.info("CGAZ boundary processing completed successfully")
-    except Exception as e:
-        error_msg = (
-            f"Error in CGAZ boundary processing: {str(e)}\n{traceback.format_exc()}"
-        )
-        logger.critical(error_msg)
+        merge(os.environ["DATABASE_URL"], s3_config_from_env(version))
+    except Exception:
+        log.exception("CGAZ merge failed")
         sys.exit(1)
+    log.info("CGAZ merge complete")
+
+
+if __name__ == "__main__":
+    main()

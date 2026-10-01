@@ -85,12 +85,23 @@ class ApiIndexTests(unittest.TestCase):
         success = self.success("gbOpen", "USA", "ADM1")
         with ExitStack() as stack:
             stack.enter_context(patch("builder.run.sync_data_repo"))
+            stack.enter_context(patch("builder.run.stage_lsib"))
             stack.enter_context(
                 patch("builder.run.create_build_db", return_value="postgresql://test")
             )
             stack.enter_context(patch("builder.run.scale_dask_workers"))
             stack.enter_context(
-                patch("builder.run.run_boundary_builds", return_value=([success], []))
+                patch("builder.run.lsib_url", return_value="https://lsib.test")
+            )
+            stack.enter_context(
+                patch(
+                    "builder.run.run_boundary_builds",
+                    return_value=(
+                        [success],
+                        [],
+                        [{"tag": "CGAZ/LSIB", "status": "ok"}],
+                    ),
+                )
             )
             upload_indexes = stack.enter_context(
                 patch(
