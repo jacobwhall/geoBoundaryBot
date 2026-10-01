@@ -65,11 +65,22 @@ spec:
                   value: {{ $.Values.builddb.storageClass | quote }}
                 - name: GB_BUILDDB_STORAGE_SIZE
                   value: {{ $.Values.builddb.size | quote }}
+                - name: GB_BUILDDB_MAX_CONNECTIONS
+                  value: {{ $.Values.builddb.maxConnections | quote }}
+                - name: GB_BUILDDB_CPU
+                  value: {{ $.Values.builddb.resources.requests.cpu | quote }}
+                - name: GB_BUILDDB_MEMORY
+                  value: {{ $.Values.builddb.resources.requests.memory | quote }}
+                - name: GB_BUILDDB_SHARED_BUFFERS
+                  value: {{ $.Values.builddb.sharedBuffers | quote }}
                 {{- if $.Values.s3.enabled }}
                 - name: S3_ENDPOINT_URL
                   value: {{ $.Values.s3.endpoint | quote }}
                 - name: S3_BUCKET
                   value: {{ $.Values.s3.bucket | quote }}
+                # The CGAZ merge Job references this Secret for its own upload
+                - name: GB_S3_CREDENTIALS_SECRET
+                  value: {{ $.Values.s3.credentialsSecret | quote }}
                 - name: AWS_ACCESS_KEY_ID
                   valueFrom:
                     secretKeyRef:

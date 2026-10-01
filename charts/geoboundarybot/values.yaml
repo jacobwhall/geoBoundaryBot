@@ -110,16 +110,28 @@ dask:
 #     --from-literal=access-key-id=<key> \
 #     --from-literal=secret-access-key=<secret>
 # Objects are uploaded under <GB_RELEASE_VERSION>/<product>/<ISO>/<ADM>/...
+# and <GB_RELEASE_VERSION>/CGAZ/...
 s3:
   enabled: false
   endpoint: "" # e.g. https://<account>.r2.cloudflarestorage.com
   bucket: ""
   credentialsSecret: gb-s3-credentials
 
-# Ephemeral PostGIS for passing build outputs to the CGAZ job
+# Ephemeral PostGIS for passing build outputs to CGAZ: the boundary builds,
+# the LSIB base layer and the per-country CGAZ parts all land here, and the
+# CGAZ merge Job reads them back
 builddb:
   image:
     repository: postgis/postgis
     tag: "17-3.5"
   storageClass: ""
   size: 250Gi
+  # Must exceed the Dask cluster's total threads (build.dask.workers x
+  # threads per worker), since every running task may hold a connection.
+  maxConnections: 500
+  resources:
+    requests:
+      cpu: "4"
+      memory: 16Gi
+  # Postgres's shared_buffers; about a quarter of the memory request.
+  sharedBuffers: 4GB
