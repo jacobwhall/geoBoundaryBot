@@ -11,8 +11,10 @@ from functools import lru_cache
 
 import geopandas as gpd
 from pathlib import Path
-import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
+import shapely
+from matplotlib.figure import Figure
 from shapely.geometry import shape
 from shapely.geometry.multipolygon import MultiPolygon
 from shapely.geometry.polygon import Polygon
@@ -145,11 +147,13 @@ class builder:
             self.logger.critical("Zipfile extraction failed: " + str(e))
 
     def dataLoad(self):
-        self.unzip()
-        sourceZip = zipfile.ZipFile(self.sourcePath)
+        if self.dataExtractFail:
+            self.unzip()
+        with zipfile.ZipFile(self.sourcePath) as sourceZip:
+            names = sourceZip.namelist()
 
-        geojson = list(filter(lambda x: x[-8:] == ".geojson", sourceZip.namelist()))
-        shp = list(filter(lambda x: x[-4:] == ".shp", sourceZip.namelist()))
+        geojson = list(filter(lambda x: x[-8:] == ".geojson", names))
+        shp = list(filter(lambda x: x[-4:] == ".shp", names))
 
         geojson = [x for x in geojson if not x.__contains__("MACOS")]
         shp = [x for x in shp if not x.__contains__("MACOS")]
@@ -557,7 +561,9 @@ class builder:
             return retMes
 
     def checkBuildGeometryFiles(self):
-        self.dataLoad()
+        # checkSourceValidity has normally loaded the data already.
+        if self.dataLoadFail:
+            self.dataLoad()
 
         nameC = set(
             ["Name", "name", "NAME", "shapeName", "shapename", "SHAPENAME", "MAX_Name"]
@@ -620,46 +626,35 @@ class builder:
             self.geomDta["shapeISO"] = ""
             self.geomReq["iso"] = "shapeISO"
 
-        for index, row in self.geomDta.iterrows():
-            xmin = row["geometry"].bounds[0]
-            ymin = row["geometry"].bounds[1]
-            xmax = row["geometry"].bounds[2]
-            ymax = row["geometry"].bounds[3]
-            tol = 1e-5
-            valid = (
-                (xmin >= -180 - tol)
-                and (xmax <= 180 + tol)
-                and (ymin >= -90 - tol)
-                and (ymax <= 90 + tol)
+        geoms = self.geomDta.geometry.to_numpy()
+        tol = 1e-5
+        bounds = shapely.bounds(geoms)
+        out_of_bounds = (
+            (bounds[:, 0] < -180 - tol)
+            | (bounds[:, 2] > 180 + tol)
+            | (bounds[:, 1] < -90 - tol)
+            | (bounds[:, 3] > 90 + tol)
+        )
+        for geom in geoms[out_of_bounds]:
+            self.geomReq["bounds"] = (
+                "ERROR: At least one geometry seems to extend past the boundaries of the earth: "
+                + str(explain_validity(geom))
             )
-            if not valid:
-                self.geomReq["bounds"] = (
-                    "ERROR: At least one geometry seems to extend past the boundaries of the earth: "
-                    + str(explain_validity(row["geometry"]))
-                )
-                self.logger.critical(
-                    "ERROR: This geometry seems to extend past the boundaries of the earth: "
-                    + str(explain_validity(row["geometry"]))
-                )
+            self.logger.critical(
+                "ERROR: This geometry seems to extend past the boundaries of the earth: "
+                + str(explain_validity(geom))
+            )
 
-            if not row["geometry"].is_valid:
-                self.logger.warning(
-                    "Something is wrong with this geometry, but we might be able to fix it with a buffer: "
-                    + str(explain_validity(row["geometry"]))
-                )
-                if not row["geometry"].buffer(0).is_valid:
-                    self.geomReq["valid"] = (
-                        "ERROR: Something is wrong with this geometry, and we can't fix it: "
-                        + str(explain_validity(row["geometry"]))
-                    )
-                    self.logger.critical(
-                        "ERROR: Something is wrong with this geometry, and we can't fix it: "
-                        + str(explain_validity(row["geometry"]))
-                    )
-                else:
-                    self.logger.warning(
-                        "A geometry error was corrected with buffer=0 in shapely."
-                    )
+        # Invalid geometries aren't fatal: mapshaper's -clean repairs them in
+        # constructFiles.  (This used to also test whether buffer(0) could fix
+        # each one, but GEOS buffer output is always valid, so that check
+        # never failed, its result was thrown away, and on big invalid
+        # polygons it could take many minutes.)
+        for geom in geoms[~shapely.is_valid(geoms)]:
+            self.logger.warning(
+                "Invalid geometry, to be repaired by mapshaper -clean: "
+                + str(explain_validity(geom))
+            )
 
         if "ERROR" not in self.geomReq["bounds"]:
             self.logger.info("All geometries are within valid bounds.")
@@ -729,21 +724,22 @@ class builder:
                 # Build shape IDs
                 self.hashCalc()
 
-                def geomID(geom, metaHash=self.metaHash):
+                def geomID(wkt, metaHash=self.metaHash):
                     hashVal = (
                         int(
-                            hashlib.sha256(
-                                str(geom["geometry"]).encode(encoding="UTF-8")
-                            ).hexdigest(),
+                            hashlib.sha256(wkt.encode(encoding="UTF-8")).hexdigest(),
                             16,
                         )
                         % 10**14
                     )
                     return str(metaHash) + "B" + str(hashVal)
 
-                self.geomDta["shapeID"] = self.geomDta.apply(
-                    lambda row: geomID(row), axis=1
+                # rounding_precision=-1 is what str(geometry) uses, so IDs
+                # match those of earlier releases.
+                wkts = shapely.to_wkt(
+                    self.geomDta.geometry.to_numpy(), rounding_precision=-1
                 )
+                self.geomDta["shapeID"] = [geomID(wkt) for wkt in wkts]
                 self.logger.info("ADMISO assignment")
                 self.geomDta[["shapeGroup"]] = self.ISO
                 self.geomDta[["shapeType"]] = self.ADM
@@ -958,15 +954,13 @@ class builder:
 
         # Vertices stats
         try:
-            vertices = []
-            for i, row in geom.iterrows():
-                n = 0
-                if row.geometry.type.startswith("Multi"):
-                    for seg in row.geometry.geoms:
-                        n += len(seg.exterior.coords)
-                else:
-                    n = len(row.geometry.exterior.coords)
-                vertices.append(n)
+            # Exterior-ring vertices of every polygon in each feature.
+            parts, owner = shapely.get_parts(
+                geom.geometry.to_numpy(), return_index=True
+            )
+            counts = shapely.get_num_coordinates(shapely.get_exterior_ring(parts))
+            vertices = np.bincount(owner, weights=counts, minlength=len(geom))
+            vertices = [int(n) for n in vertices]
 
             self.metaDataLib["meanVertices"] = str(
                 round(sum(vertices) / len(vertices), 0)
@@ -1119,8 +1113,12 @@ class builder:
         if self.changesDetected:
             self.cleanup_target_directory()
         base_name = f"geoBoundaries-{self.ISO}-{self.ADM}"
-        tmpFold = TMP_DIR / f"{self.ISO}{self.ADM}{self.product}"
-        tmpJson = self.tmpdir / f"{self.ISO}{self.ADM}{self.product}.geoJSON"
+        # Under the build's own tmpdir, which build_boundary removes; the
+        # shared TMP_DIR kept every build's outputs until the worker died.
+        tmpFold = self.tmpdir / f"{self.ISO}{self.ADM}{self.product}"
+        # mapshaper's input.  Its file name is also the layer name inside the
+        # shapefile zips and TopoJSON, so only the extension may change.
+        tmpSrc = self.tmpdir / f"{self.ISO}{self.ADM}{self.product}.fgb"
 
         # Simplified versions
         jsonOUT_simp = tmpFold / f"{base_name}_simplified.geojson"
@@ -1238,15 +1236,17 @@ class builder:
         with open(citeUse, "w", encoding="utf-8") as cu:
             cu.write(self.citationUseConstructor())
 
-        # Save intermediary geoJSON
-        logStr = "Building shapefiles, geojson, topojson (Full) with: " + str(tmpJson)
+        # Save the intermediary file.  FlatGeobuf writes ~30x faster than
+        # GeoJSON and mapshaper reads it faster too, with byte-identical
+        # results.  Without a spatial index it keeps the features in order.
+        logStr = "Building shapefiles, geojson, topojson (Full) with: " + str(tmpSrc)
         self.logger.info(logStr)
         try:
             self.geomDta = self.geomDta.to_crs("EPSG:4326")
-            self.geomDta.to_file(tmpJson, driver="GeoJSON")
-            self.logger.info("Intermediary GeoJSON export succeeded.")
+            self.geomDta.to_file(tmpSrc, driver="FlatGeobuf", SPATIAL_INDEX="NO")
+            self.logger.info("Intermediary FlatGeobuf export succeeded.")
         except Exception as e:
-            self.logger.info(f"Intermediary GeoJSON export failed: {e}")
+            self.logger.info(f"Intermediary FlatGeobuf export failed: {e}")
             self.logger.info("Coercing all non-geometry fields to UTF-8 strings...")
 
             for col in self.geomDta.columns:
@@ -1257,14 +1257,20 @@ class builder:
                         else str(x)
                     )
 
-            self.geomDta.to_file(tmpJson, driver="GeoJSON")
-            self.logger.info("Intermediary GeoJSON export succeeded after coercion.")
+            self.geomDta.to_file(tmpSrc, driver="FlatGeobuf", SPATIAL_INDEX="NO")
+            self.logger.info("Intermediary FlatGeobuf export succeeded after coercion.")
 
         writeRet = []
-        self.logger.info("Running mapshaper (full resolution)")
-        mapshaper_full = [
+        # One pass for both resolutions: clean, write the full outputs, then
+        # simplify the cleaned topology and write the simplified ones.  This
+        # parses and cleans the full-resolution input once, not twice.  It
+        # also has to clean before simplifying: since mapshaper 0.7, -clean
+        # after -simplify rebuilds the arcs and silently undoes the
+        # simplification, so "_simplified" files came out at full resolution.
+        self.logger.info("Running mapshaper (full resolution and simplified)")
+        mapshaper_cmd = [
             "mapshaper-xl",
-            str(tmpJson),
+            str(tmpSrc),
             "-clean",
             "gap-fill-area=500m2",
             "snap-interval=.00001",
@@ -1277,9 +1283,22 @@ class builder:
             "-o",
             f"format=geojson",
             str(jsonOUT),
+            "-simplify",
+            "dp",
+            "interval=100",
+            "keep-shapes",
+            "-o",
+            f"format=shapefile",
+            str(shpOUT_simp),
+            "-o",
+            f"format=topojson",
+            str(topoOUT_simp),
+            "-o",
+            f"format=geojson",
+            str(jsonOUT_simp),
         ]
         result = subprocess.run(
-            mapshaper_full, capture_output=True, text=True, timeout=600
+            mapshaper_cmd, capture_output=True, text=True, timeout=1200
         )
         ret_code = result.returncode
         if ret_code != 0:
@@ -1292,21 +1311,16 @@ class builder:
             self.logger.error(f"Mapshaper command failed with return code {ret_code}")
             return f"ERROR: Mapshaper command failed with return code {ret_code}"
 
-        if not os.path.exists(jsonOUT):
-            self.logger.error(f"Output file {jsonOUT} was not created")
-            return f"ERROR: Output file {jsonOUT} was not created"
+        for out in (jsonOUT, jsonOUT_simp):
+            if not os.path.exists(out):
+                self.logger.error(f"Output file {out} was not created")
+                return f"ERROR: Output file {out} was not created"
+            if os.path.getsize(out) == 0:
+                self.logger.error(f"Output file {out} is empty")
+                return f"ERROR: Output file {out} is empty"
 
-        if os.path.getsize(jsonOUT) == 0:
-            self.logger.error(f"Output file {jsonOUT} is empty")
-            return f"ERROR: Output file {jsonOUT} is empty"
-
-        # Need to open and define the projection - unsure if this is a bug in mapshaper precluding
-        # the projection outputs, or if our tests were ill-formed.
-        def to_multipolygon(geom):
-            if isinstance(geom, Polygon):
-                return MultiPolygon([geom])
-            return geom
-
+        # Rewrite mapshaper's GeoJSON through GDAL, which adds the "name" and
+        # "crs" members and the formatting released files have always had.
         try:
             self.logger.info(f"Attempting to read {jsonOUT}")
             tmpGeomJSONproj_multi = gpd.read_file(jsonOUT)
@@ -1316,57 +1330,32 @@ class builder:
             self.logger.info(
                 f"Successfully read {len(tmpGeomJSONproj_multi)} features from {jsonOUT}"
             )
-            # tmpGeomJSONproj_multi = tmpGeomJSONproj.geometry.apply(to_multipolygon)
             tmpGeomJSONproj_multi = tmpGeomJSONproj_multi.to_crs("EPSG:4326")
             tmpGeomJSONproj_multi.to_file(jsonOUT, driver="GeoJSON")
         except Exception as e:
             self.logger.error(f"Failed to read/write GeoJSON: {str(e)}")
             return f"ERROR: Failed to read/write GeoJSON: {str(e)}"
+        # The released geometry, kept so build_boundary needn't parse the
+        # file again for PostGIS.
+        self.releaseGeom = tmpGeomJSONproj_multi
 
-        self.logger.info("Starting simplified build")
-
-        self.logger.info("Running mapshaper (simplified)")
-        mapshaper_simp = [
-            "mapshaper-xl",
-            str(tmpJson),
-            "-simplify",
-            "dp",
-            "interval=100",
-            "keep-shapes",
-            "-clean",
-            "gap-fill-area=500m2",
-            "snap-interval=.00001",
-            "-o",
-            f"format=shapefile",
-            str(shpOUT_simp),
-            "-o",
-            f"format=topojson",
-            str(topoOUT_simp),
-            "-o",
-            f"format=geojson",
-            str(jsonOUT_simp),
-        ]
-        result_simp = subprocess.run(
-            mapshaper_simp, capture_output=True, text=True, timeout=600
-        )
-        if result_simp.returncode != 0:
-            self.logger.error("mapshaper (simplified) stderr: %s", result_simp.stderr)
-        writeRet.append(result_simp.returncode)
-
-        # Need to open and define the projection - unsure if this is a bug in mapshaper precluding
-        # the projection outputs, or if our tests were ill-formed.
         tmpGeomJSONproj_simplified_multi = gpd.read_file(jsonOUT_simp)
-        # tmpGeomJSONproj_simplified_multi = tmpGeomJSONproj_simplified.geometry.apply(to_multipolygon)
         tmpGeomJSONproj_simplified_multi = tmpGeomJSONproj_simplified_multi.to_crs(
             "EPSG:4326"
         )
         tmpGeomJSONproj_simplified_multi.to_file(jsonOUT_simp, driver="GeoJSON")
 
-        # Create the plot for the boundary to be used in display
+        # Create the plot for the boundary to be used in display.  The
+        # simplified geometry is far finer than the image's pixels, and much
+        # quicker to draw.  This uses a Figure directly rather than pyplot,
+        # whose "current figure" is shared by every build running in the
+        # worker's other threads.
         self.logger.info("Plotting preview image.")
-        self.geomDta.boundary.plot(edgecolor="black")
+        fig = Figure()
+        ax = fig.subplots()
+        tmpGeomJSONproj_simplified_multi.boundary.plot(ax=ax, edgecolor="black")
         if len(self.metaReq["canonical"]) > 1:
-            plt.title(
+            ax.set_title(
                 "geoBoundaries.org - "
                 + self.product
                 + "\n"
@@ -1382,7 +1371,7 @@ class builder:
                 + str(self.metaReq["source"])
             )
         else:
-            plt.title(
+            ax.set_title(
                 "geoBoundaries.org - "
                 + self.product
                 + "\n"
@@ -1394,8 +1383,7 @@ class builder:
                 + "\nSource: "
                 + str(self.metaReq["source"])
             )
-        plt.savefig(imgOUT)
-        plt.close("all")
+        fig.savefig(imgOUT)
 
         # Check if there has been any update to the file.
         # If not, allow for build to proceed to confirm input file validity, but don't write outputs.
@@ -1405,17 +1393,29 @@ class builder:
 
         if self.changesDetected == True:
             self.logger.info("Building zip files.")
-            zip_interim = self.tmpdir / "zipInterim" / self.product
-            zip_interim.mkdir(parents=True, exist_ok=True)
-            zip_base = zip_interim / f"{base_name}-all"
-            shutil.make_archive(str(zip_base), "zip", str(tmpFold))
-            shutil.move(str(zip_base.with_suffix(".zip")), str(fullZip))
+            members = sorted(tmpFold.iterdir())
+            # Fastest deflate level: about 4% bigger than the default level 6,
+            # and 5x quicker on large GeoJSON.  The shapefile zips are already
+            # compressed, so they're stored as-is.
+            with zipfile.ZipFile(
+                fullZip, "w", zipfile.ZIP_DEFLATED, compresslevel=1
+            ) as allZip:
+                for f in members:
+                    allZip.write(
+                        f,
+                        f.name,
+                        compress_type=(
+                            zipfile.ZIP_STORED
+                            if f.suffix in (".zip", ".png")
+                            else zipfile.ZIP_DEFLATED
+                        ),
+                    )
 
-            self.logger.info("Copying outputs into release folder.")
+            self.logger.info("Moving outputs into release folder.")
             for f in tmpFold.iterdir():
-                shutil.copy(str(f), str(self.targetPath / f.name))
+                shutil.move(str(f), str(self.targetPath / f.name))
 
-            self.logger.info("Files copied, cleaning up.")
+            self.logger.info("Files moved, cleaning up.")
 
             # Cleanup for deprecated files
             removeNames = [

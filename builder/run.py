@@ -763,7 +763,10 @@ def build_boundary(
                 b.targetPath / f"geoBoundaries-{iso}-{adm}.geojson"
             )
             if geojson_path.exists():
-                gdf = gpd.read_file(geojson_path)
+                # constructFiles has already parsed the released GeoJSON.
+                gdf = getattr(b, "releaseGeom", None)
+                if gdf is None:
+                    gdf = gpd.read_file(geojson_path)
                 gdf = gdf.to_crs(epsg=4326)
                 gdf["product"] = product
                 gdf["iso"] = iso

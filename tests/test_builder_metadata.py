@@ -1,9 +1,13 @@
+import hashlib
 import math
 import tempfile
 import unittest
 import zipfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+import geopandas as gpd
+from shapely.geometry import MultiPolygon, Polygon, box
 
 from builder import builder_class
 from builder.builder_class import (
@@ -118,6 +122,55 @@ class TabularMetadataTests(unittest.TestCase):
         self.assertEqual(meta["worldBankIncomeGroup"], "Lower-middle-income Countries")
         for key, value in meta.items():
             self.assertFalse(isinstance(value, float) and math.isnan(value), key)
+
+
+class GeometryTests(unittest.TestCase):
+    def geometry_builder(self, geoms):
+        b = builder("KEN", "ADM1", "gbOpen", ["KEN"], ["Public Domain"], tmpdir="/tmp")
+        b.geomDta = gpd.GeoDataFrame(
+            {"shapeName": [f"n{i}" for i in range(len(geoms))]},
+            geometry=geoms,
+            crs="EPSG:4326",
+        )
+        b.dataLoadFail = 0
+        b.metaHash = "12345678"
+        return b
+
+    def test_shape_ids_hash_each_geometry_as_before(self):
+        bowtie = Polygon([(0, 0), (1, 1), (1, 0), (0, 1)])
+        b = self.geometry_builder([box(0, 0, 1, 1), bowtie])
+        with patch.object(b, "hashCalc"):
+            message = b.checkBuildGeometryFiles()
+
+        # An invalid geometry is only warned about; mapshaper repairs it.
+        self.assertNotIn("ERROR", message.upper(), message)
+        for geom, shape_id in zip(b.geomDta.geometry, b.geomDta["shapeID"]):
+            # The per-row formula IDs have always been built with.
+            digest = hashlib.sha256(str(geom).encode("UTF-8")).hexdigest()
+            self.assertEqual(shape_id, f"12345678B{int(digest, 16) % 10**14}")
+        self.assertTrue(all(g.geom_type == "MultiPolygon" for g in b.geomDta.geometry))
+
+    def test_out_of_bounds_geometry_fails(self):
+        b = self.geometry_builder([box(0, 0, 1, 1), box(179, 0, 181, 1)])
+        with patch.object(b, "hashCalc"):
+            message = b.checkBuildGeometryFiles()
+        self.assertIn("extend past the boundaries of the earth", message)
+
+    def test_vertex_stats_count_exterior_rings(self):
+        holed = Polygon(
+            [(0, 0), (4, 0), (4, 4), (0, 4)], [[(1, 1), (2, 1), (2, 2), (1, 2)]]
+        )
+        b = self.geometry_builder(
+            [
+                MultiPolygon([holed]),  # 5 exterior coords; the hole doesn't count
+                MultiPolygon([box(5, 5, 6, 6), box(7, 7, 8, 8)]),  # 5 + 5
+            ]
+        )
+        self.assertNotIn("ERROR", b.calculateGeomMeta())
+        self.assertEqual(b.metaDataLib["admUnitCount"], "2")
+        self.assertEqual(b.metaDataLib["minVertices"], "5")
+        self.assertEqual(b.metaDataLib["maxVertices"], "10")
+        self.assertEqual(b.metaDataLib["meanVertices"], "8.0")
 
 
 if __name__ == "__main__":

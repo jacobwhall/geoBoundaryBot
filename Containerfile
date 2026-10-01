@@ -7,6 +7,8 @@ ENV PYTHONUNBUFFERED=1 \
     UV_COMPILE_BYTECODE=1
 
 # System deps: geospatial libs, mapshaper, git-lfs
+# mapshaper is pinned because its releases change output: 0.7 broke the old
+# simplify-then-clean order in builder_class.constructFiles.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     git-lfs \
@@ -14,7 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     nodejs \
     npm && \
     apt-get clean && rm -rf /var/lib/apt/lists/* && \
-    npm install -g mapshaper && \
+    npm install -g mapshaper@0.7.71 && \
     ln -sf /usr/local/bin/mapshaper /usr/local/bin/mapshaper-xl && \
     git lfs install --system
 
