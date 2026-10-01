@@ -13,8 +13,10 @@ Orchestrates the full build:
      (each worker pushes its output geometries to PostGIS and uploads
       its build outputs to S3 under {GB_RELEASE_VERSION}/...).
      The per-country CGAZ work rides along on the same cluster: one task
-     loads LSIB into PostGIS, and each gbOpen country gets a task that
-     starts as soon as its ADM0-2 builds finish (see builder.cgaz_builder)
+     loads LSIB into PostGIS, and each gbOpen country gets a task once its
+     ADM0-2 builds finish (see builder.cgaz_builder).  The driver feeds
+     Dask one task per free worker thread: LSIB, then builds biggest-first,
+     then CGAZ countries, so CGAZ fills workers as the builds tail off
   5. Scale down Dask workers
   6. Publish per-product API indexes to S3
   7. Launch a single-pod CGAZ Job that merges the per-country parts from
@@ -29,6 +31,8 @@ Orchestrates the full build:
 """
 
 import hashlib
+import heapq
+import itertools
 import json
 from botocore.exceptions import ClientError
 import logging
@@ -361,6 +365,10 @@ def create_build_db(timeout=120):
     image = os.environ.get("GB_POSTGIS_IMAGE", "postgis/postgis:17-3.5")
     storage_class = os.environ.get("GB_BUILDDB_STORAGE_CLASS", "")
     storage_size = os.environ.get("GB_BUILDDB_STORAGE_SIZE", "50Gi")
+    # Every Dask thread can hold a connection at once (each build writes its
+    # boundary, each CGAZ task reads and writes parts), and Postgres's
+    # default of 100 is well under 48 workers x 4 threads.
+    max_connections = os.environ.get("GB_BUILDDB_MAX_CONNECTIONS", "500")
     name = f"{release}-builddb"
     # Unique per run: reusing a claim name before the old PV is reclaimed lets
     # the vcluster syncer bind the new claim to the dying volume, leaving it
@@ -405,6 +413,11 @@ def create_build_db(timeout=120):
                             {
                                 "name": "postgis",
                                 "image": image,
+                                "args": [
+                                    "postgres",
+                                    "-c",
+                                    f"max_connections={max_connections}",
+                                ],
                                 "env": [
                                     {"name": "POSTGRES_DB", "value": "geoboundaries"},
                                     {"name": "POSTGRES_USER", "value": "gb"},
@@ -818,65 +831,126 @@ def build_boundary(
         timer.stop()
 
 
-def submit_cgaz_tasks(client, builds, db_url, lsib_url, version):
-    """Queue the per-country CGAZ tasks behind the gbOpen builds they read.
+# What the driver hands to Dask first.  LSIB leads, since no CGAZ country can
+# start without it; then every build, biggest source first; then the CGAZ
+# countries, biggest first, which fill workers as the builds tail off.
+_RANK = {"lsib": 0, "build": 1, "cgaz": 2}
 
-    `builds` maps each build future to its (product, iso, adm, size).  Each
-    country's task takes its gbOpen ADM0-2 build futures as arguments, so
-    Dask starts it once those builds finish while other builds are still
-    running.  Priorities follow the builds' biggest-first ordering: LSIB
-    goes ahead of everything, and each country is weighted by the source
-    size of the boundaries it clips.
 
-    Returns {future: tag} for the LSIB task and every country task.
+class BuildQueue:
+    """The driver's priority queue of Dask work, CGAZ dependencies included.
+
+    Dask only orders tasks within each worker's own queue, and hands every
+    task to a worker the moment it's submitted (our per-country task groups
+    are far too small for its scheduler-side queuing).  Submitting
+    everything up front can leave a 20-minute build waiting on one worker
+    behind trivial ones while other workers sit idle.  So the driver keeps
+    the queue here and submits one task per free worker thread, always the
+    next by _RANK, then source size.
+
+    A CGAZ country is queued once LSIB has loaded and all of that country's
+    gbOpen ADM0-2 builds have finished, successfully or not.
     """
 
-    by_iso = {}
-    for future, (product, iso, adm, size) in builds.items():
-        if product == "gbOpen" and adm in cgaz_builder.LEVELS:
-            deps = by_iso.setdefault(iso, {"futures": [], "size": 0})
-            deps["futures"].append(future)
-            deps["size"] += size
+    def __init__(
+        self, boundaries, db_url, lsib_url, s3_config=None, version="nightly"
+    ):
+        self._heap = []
+        self._seq = itertools.count()
+        self._db_url = db_url
+        self._version = version
+        self.lsib_ok = None
+        # Per gbOpen country: the ADM0-2 builds still running, the results
+        # of those that finished, and their summed source size.
+        self._waiting = {}
+        self._finished = {}
+        self._cgaz_size = {}
 
-    lsib = client.submit(
-        cgaz_builder.prepare_lsib,
-        lsib_url,
-        db_url,
-        key=f"{version}-cgaz-lsib",
-        priority=max((size for *_, size in builds.values()), default=0) + 1,
-    )
-    tasks = {lsib: "CGAZ/LSIB"}
-    for iso, deps in sorted(by_iso.items()):
-        future = client.submit(
-            cgaz_builder.build_cgaz_country,
-            iso,
-            db_url,
-            lsib,
-            *deps["futures"],
-            key=f"{version}-cgaz-{iso}",
-            priority=deps["size"],
+        self._push(
+            "lsib",
+            0,
+            cgaz_builder.prepare_lsib,
+            (lsib_url, db_url),
+            key=f"{version}-cgaz-lsib",
+            tag="CGAZ/LSIB",
         )
-        tasks[future] = f"CGAZ/{iso}"
-    log.info("Queued CGAZ work for %d gbOpen countries", len(by_iso))
-    return tasks
+        for product, iso, adm, size in boundaries:
+            self._push(
+                "build",
+                size,
+                build_boundary,
+                (product, iso, adm, db_url),
+                {"s3_config": s3_config},
+                key=f"{version}-{product}-{iso}-{adm}",
+                tag=f"{product}/{iso}_{adm}",
+                boundary=(product, iso, adm),
+            )
+            if product == "gbOpen" and adm in cgaz_builder.LEVELS:
+                self._waiting.setdefault(iso, set()).add(adm)
+                self._cgaz_size[iso] = self._cgaz_size.get(iso, 0) + size
+
+    def __len__(self):
+        return len(self._heap)
+
+    @property
+    def cgaz_countries(self):
+        return len(self._cgaz_size)
+
+    def _push(self, kind, size, fn, args, kwargs=None, **task):
+        task.update(kind=kind, fn=fn, args=args, kwargs=kwargs or {})
+        heapq.heappush(self._heap, (_RANK[kind], -size, next(self._seq), task))
+
+    def pop(self):
+        """Remove and return the most important queued task."""
+        return heapq.heappop(self._heap)[-1]
+
+    def finished(self, task, result):
+        """Record a finished task, queueing any CGAZ country it unblocks."""
+
+        if task["kind"] == "lsib":
+            self.lsib_ok = result.get("status") == "ok"
+            ready = [iso for iso, adms in self._waiting.items() if not adms]
+        elif task["kind"] == "build":
+            product, iso, adm = task["boundary"]
+            if product != "gbOpen" or adm not in cgaz_builder.LEVELS:
+                return
+            self._waiting[iso].discard(adm)
+            self._finished.setdefault(iso, []).append(
+                {"adm": adm, "status": result.get("status")}
+            )
+            lsib_done = self.lsib_ok is not None
+            ready = [iso] if lsib_done and not self._waiting[iso] else []
+        else:
+            return
+
+        for iso in ready:
+            del self._waiting[iso]
+            builds = self._finished.pop(iso)
+            # Without LSIB there's nothing to clip to; the run fails on that.
+            if not self.lsib_ok:
+                continue
+            self._push(
+                "cgaz",
+                self._cgaz_size[iso],
+                cgaz_builder.build_cgaz_country,
+                (iso, self._db_url, builds),
+                key=f"{self._version}-cgaz-{iso}",
+                tag=f"CGAZ/{iso}",
+            )
 
 
 def run_boundary_builds(
     scheduler_url, db_url, lsib_url, s3_config=None, version="nightly", strict=False
 ):
-    """Connect to Dask, discover boundaries, and fan out the builds together
+    """Connect to Dask, discover boundaries, and run the builds together
     with the per-country CGAZ work that reads their output.
 
     Returns (successes, failures, cgaz_results): the per-boundary result
     dicts returned by `build_boundary`, and the results of the CGAZ tasks.
-    In strict mode, if any build failed, the CGAZ tasks still outstanding
-    once the last build finishes are cancelled, since the run is going to
-    abort anyway.
+    In strict mode, if any build failed, the CGAZ work still running or
+    queued once the last build finishes is abandoned, since the run is
+    going to abort anyway.
     """
-
-    log.info("Connecting to Dask scheduler at %s", scheduler_url)
-    client = Client(scheduler_url)
-    log.info("Dashboard: %s", client.dashboard_link)
 
     boundaries = discover_boundaries()
     log.info("Discovered %d boundaries to build", len(boundaries))
@@ -885,55 +959,64 @@ def run_boundary_builds(
         log.info("Nothing to build.")
         return [], [], []
 
-    # Bigger source files take longest to build, so start them first to
-    # shorten the tail.  Dask runs higher-priority tasks first.
-    builds = {
-        client.submit(
-            build_boundary,
-            product,
-            iso,
-            adm,
-            db_url,
-            s3_config=s3_config,
-            key=f"{version}-{product}-{iso}-{adm}",
-            priority=size,
-        ): (product, iso, adm, size)
-        for product, iso, adm, size in boundaries
-    }
-    cgaz = submit_cgaz_tasks(client, builds, db_url, lsib_url, version)
+    queue = BuildQueue(boundaries, db_url, lsib_url, s3_config, version)
+    log.info("CGAZ will cover %d gbOpen countries", queue.cgaz_countries)
+
+    log.info("Connecting to Dask scheduler at %s", scheduler_url)
+    with Client(scheduler_url) as client:
+        log.info("Dashboard: %s", client.dashboard_link)
+        return _drain_build_queue(client, queue, len(boundaries), strict)
+
+
+def _drain_build_queue(client, queue, n_builds, strict):
+    running = {}
+    dispatched = itertools.count()
+    # raise_errors=False: a task that raised (e.g. its worker was OOM-killed
+    # too often) is logged as a failure instead of crashing the driver.
+    completed = as_completed(with_results=True, raise_errors=False)
+
+    def top_up():
+        # Re-read every time, since workers can die and be replaced mid-run.
+        slots = max(sum(client.nthreads().values()), 1)
+        while queue and len(running) < slots:
+            task = queue.pop()
+            future = client.submit(
+                task["fn"],
+                *task["args"],
+                key=task["key"],
+                # Only matters if Dask doubles tasks up on one worker.
+                priority=-next(dispatched),
+                **task["kwargs"],
+            )
+            running[future] = task
+            completed.add(future)
 
     successes = []
     failures = []
     cgaz_results = []
-    builds_left = len(builds)
+    builds_left = n_builds
     t0 = time.monotonic()
 
-    # raise_errors=False: a task that raised (e.g. its worker was OOM-killed
-    # too often) is logged as a failure instead of crashing the driver.
-    for future, result in as_completed(
-        [*builds, *cgaz], with_results=True, raise_errors=False
-    ):
-        if future in builds:
-            product, iso, adm, _ = builds[future]
-            if future.status == "error":
-                result = {
-                    "product": product,
-                    "iso": iso,
-                    "adm": adm,
-                    "status": "error",
-                    "failed_stage": "dask",
-                    "error": repr(result[1]),
-                }
-            tag = f"{product}/{iso}_{adm}"
+    top_up()
+    for future, result in completed:
+        task = running.pop(future)
+        if future.status == "error":
+            result = {"status": "error", "error": repr(result[1])}
+            if task["kind"] == "build":
+                product, iso, adm = task["boundary"]
+                result.update(product=product, iso=iso, adm=adm, failed_stage="dask")
+        queue.finished(task, result)
+
+        if task["kind"] == "build":
             total = result.get("timings", {}).get("total", 0)
             if result["status"] == "ok":
                 successes.append(result)
-                log.info("OK  %s (%.0fs)", tag, total)
+                log.info("OK  %s (%.0fs)", task["tag"], total)
             else:
                 failures.append(result)
                 log.error(
                     "FAIL %s stage=%s (%.0fs): %s",
-                    tag,
+                    task["tag"],
                     result.get("failed_stage"),
                     total,
                     result.get("error"),
@@ -949,23 +1032,23 @@ def run_boundary_builds(
                 )
                 log_build_timings(successes + failures)
                 if strict and failures:
-                    client.cancel(list(cgaz))
-                    log.info("Cancelled outstanding CGAZ work (strict mode)")
+                    client.cancel(list(running))
+                    log.info("Abandoned outstanding CGAZ work (strict mode)")
                     break
-            continue
-
-        tag = cgaz[future]
-        if future.status == "error":
-            result = {"status": "error", "error": repr(result[1])}
-        result["tag"] = tag
-        cgaz_results.append(result)
-        total = result.get("timings", {}).get("total", 0)
-        if result["status"] == "error":
-            log.error("FAIL %s (%.0fs): %s", tag, total, result.get("error"))
-        elif result["status"] == "skipped":
-            log.info("SKIP %s: %s", tag, result.get("reason"))
         else:
-            log.info("OK  %s (%.0fs)", tag, total)
+            result["tag"] = task["tag"]
+            cgaz_results.append(result)
+            total = result.get("timings", {}).get("total", 0)
+            if result["status"] == "error":
+                log.error(
+                    "FAIL %s (%.0fs): %s", task["tag"], total, result.get("error")
+                )
+            elif result["status"] == "skipped":
+                log.info("SKIP %s: %s", task["tag"], result.get("reason"))
+            else:
+                log.info("OK  %s (%.0fs)", task["tag"], total)
+
+        top_up()
 
     log.info(
         "CGAZ tasks: %d ok, %d skipped, %d failed (%.0fs since the builds started)",

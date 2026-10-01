@@ -1,8 +1,10 @@
 import os
+import time
 import unittest
 from unittest.mock import MagicMock, patch
 
 import geopandas as gpd
+from dask.distributed import LocalCluster
 from shapely.geometry import box
 
 from builder import cgaz_builder, run
@@ -77,13 +79,6 @@ class SourceTests(unittest.TestCase):
         self.assertEqual(sources({"ADM0"}), {"ADM1": "ADM0", "ADM2": "ADM0"})
         self.assertEqual(sources(set()), {"ADM1": None, "ADM2": None})
 
-    def test_country_task_waits_out_a_failed_lsib(self):
-        result = cgaz_builder.build_cgaz_country(
-            "KEN", "postgresql://unused", {"status": "error"}
-        )
-        self.assertEqual(result["status"], "error")
-        self.assertIn("LSIB", result["error"])
-
 
 class MergeTests(unittest.TestCase):
     def test_level_sql_only_takes_known_levels(self):
@@ -116,95 +111,193 @@ class MergeTests(unittest.TestCase):
         )
 
 
-class FakeFuture:
-    def __init__(self, key, status="finished"):
-        self.key = key
-        self.status = status
-
-    def __repr__(self):
-        return f"<FakeFuture {self.key}>"
+STARTED = []
+SLEEP = {"CAN": 0.5, "USA": 0.4}
 
 
-class SchedulingTests(unittest.TestCase):
+def fake_build(product, iso, adm, db_url, s3_config=None):
+    STARTED.append(f"{product}/{iso}_{adm}")
+    if iso == "BOOM":
+        raise MemoryError("worker ran out of memory")
+    time.sleep(SLEEP.get(iso, 0.05))
+    status = "error" if iso == "BAD" else "ok"
+    return {"product": product, "iso": iso, "adm": adm, "status": status}
+
+
+def fake_lsib(lsib_url, db_url):
+    STARTED.append("CGAZ/LSIB")
+    return {"status": "ok"}
+
+
+def fake_country(iso, db_url, builds):
+    STARTED.append(f"CGAZ/{iso}")
+    time.sleep(0.3)
+    return {"status": "ok", "iso": iso, "builds": builds}
+
+
+class BuildQueueTests(unittest.TestCase):
+    BOUNDARIES = [
+        ("gbOpen", "KEN", "ADM1", 20),
+        ("gbOpen", "CAN", "ADM2", 900),
+        ("gbOpen", "KEN", "ADM0", 10),
+        ("gbHumanitarian", "KEN", "ADM1", 50),
+        ("gbOpen", "KEN", "ADM3", 5),
+    ]
+
     def setUp(self):
-        self.client = MagicMock()
-        self.client.submit.side_effect = lambda fn, *args, key, priority, **kw: (
-            FakeFuture(key)
+        self.queue = run.BuildQueue(self.BOUNDARIES, "postgresql://db", "https://lsib")
+
+    def drain(self):
+        tasks = []
+        while self.queue:
+            tasks.append(self.queue.pop())
+        return tasks
+
+    def test_lsib_then_builds_biggest_first(self):
+        self.assertEqual(
+            [t["tag"] for t in self.drain()],
+            [
+                "CGAZ/LSIB",
+                "gbOpen/CAN_ADM2",
+                "gbHumanitarian/KEN_ADM1",
+                "gbOpen/KEN_ADM1",
+                "gbOpen/KEN_ADM0",
+                "gbOpen/KEN_ADM3",
+            ],
+        )
+        self.assertEqual(self.queue.cgaz_countries, 2)
+
+    def test_country_waits_for_lsib_and_its_gbopen_levels(self):
+        tasks = {t["tag"]: t for t in self.drain()}
+        done = self.queue.finished
+
+        done(tasks["gbOpen/KEN_ADM1"], {"status": "ok"})
+        done(tasks["gbOpen/KEN_ADM3"], {"status": "ok"})
+        done(tasks["gbHumanitarian/KEN_ADM1"], {"status": "ok"})
+        done(tasks["CGAZ/LSIB"], {"status": "ok"})
+        self.assertEqual(len(self.queue), 0)  # still waiting on KEN ADM0
+
+        done(tasks["gbOpen/KEN_ADM0"], {"status": "error"})
+        cgaz = self.queue.pop()
+        self.assertEqual(cgaz["tag"], "CGAZ/KEN")
+        self.assertIs(cgaz["fn"], cgaz_builder.build_cgaz_country)
+        self.assertEqual(
+            cgaz["args"],
+            (
+                "KEN",
+                "postgresql://db",
+                [{"adm": "ADM1", "status": "ok"}, {"adm": "ADM0", "status": "error"}],
+            ),
         )
 
-    def test_country_tasks_wait_on_their_gbopen_admin_levels(self):
-        builds = {
-            FakeFuture("ken0"): ("gbOpen", "KEN", "ADM0", 10),
-            FakeFuture("ken1"): ("gbOpen", "KEN", "ADM1", 20),
-            FakeFuture("ken3"): ("gbOpen", "KEN", "ADM3", 900),
-            FakeFuture("kenh"): ("gbHumanitarian", "KEN", "ADM1", 50),
-            FakeFuture("uga2"): ("gbOpen", "UGA", "ADM2", 5),
+        # A country whose builds finish before LSIB is queued with LSIB.
+        queue = run.BuildQueue(self.BOUNDARIES, "postgresql://db", "https://lsib")
+        tasks = {
+            t["tag"]: t for t in iter(lambda: queue.pop() if queue else None, None)
         }
+        queue.finished(tasks["gbOpen/CAN_ADM2"], {"status": "ok"})
+        self.assertEqual(len(queue), 0)
+        queue.finished(tasks["CGAZ/LSIB"], {"status": "ok"})
+        self.assertEqual(queue.pop()["tag"], "CGAZ/CAN")
 
-        tasks = run.submit_cgaz_tasks(
-            self.client, builds, "postgresql://db", "https://lsib", "v7"
+    def test_cgaz_waits_behind_every_queued_build(self):
+        lsib = self.queue.pop()
+        can = self.queue.pop()
+        self.queue.finished(lsib, {"status": "ok"})
+        self.queue.finished(can, {"status": "ok"})
+        # CGAZ/CAN is ready, but the remaining builds still go first.
+        self.assertEqual(
+            [t["tag"] for t in self.drain()],
+            [
+                "gbHumanitarian/KEN_ADM1",
+                "gbOpen/KEN_ADM1",
+                "gbOpen/KEN_ADM0",
+                "gbOpen/KEN_ADM3",
+                "CGAZ/CAN",
+            ],
         )
 
-        self.assertEqual(sorted(tasks.values()), ["CGAZ/KEN", "CGAZ/LSIB", "CGAZ/UGA"])
-        calls = {c.kwargs["key"]: c for c in self.client.submit.call_args_list}
-        lsib = calls["v7-cgaz-lsib"]
-        self.assertIs(lsib.args[0], cgaz_builder.prepare_lsib)
-        # Ahead of the biggest build.
-        self.assertEqual(lsib.kwargs["priority"], 901)
+    def test_failed_lsib_queues_no_countries(self):
+        tasks = {t["tag"]: t for t in self.drain()}
+        self.queue.finished(tasks["CGAZ/LSIB"], {"status": "error"})
+        for tag, task in tasks.items():
+            if tag != "CGAZ/LSIB":
+                self.queue.finished(task, {"status": "ok"})
+        self.assertEqual(len(self.queue), 0)
 
-        ken = calls["v7-cgaz-KEN"]
-        self.assertIs(ken.args[0], cgaz_builder.build_cgaz_country)
-        lsib_future = next(f for f, tag in tasks.items() if tag == "CGAZ/LSIB")
-        self.assertIs(ken.args[3], lsib_future)
-        self.assertEqual([f.key for f in ken.args[4:]], ["ken0", "ken1"])
-        self.assertEqual(ken.kwargs["priority"], 30)
 
-    @patch("builder.run.discover_boundaries")
-    @patch("builder.run.as_completed")
-    @patch("builder.run.Client")
-    def test_strict_failure_cancels_outstanding_cgaz(
-        self, client_cls, as_completed, discover
-    ):
-        client = client_cls.return_value
-        futures = {}
+@patch("builder.cgaz_builder.build_cgaz_country", fake_country)
+@patch("builder.cgaz_builder.prepare_lsib", fake_lsib)
+@patch("builder.run.build_boundary", fake_build)
+class DaskDispatchTests(unittest.TestCase):
+    """The driver's dispatch loop against a real (in-process) Dask cluster."""
 
-        def submit(fn, *args, key, priority, **kwargs):
-            futures[key] = FakeFuture(key)
-            return futures[key]
-
-        client.submit.side_effect = submit
-        discover.return_value = [
-            ("gbOpen", "KEN", "ADM1", 10),
-            ("gbOpen", "UGA", "ADM1", 20),
-        ]
-
-        def completed(fs, with_results, raise_errors):
-            self.assertFalse(raise_errors)
-            ok = {"product": "gbOpen", "iso": "KEN", "adm": "ADM1", "status": "ok"}
-            lsib = {"status": "ok"}
-            futures["v7-gbOpen-UGA-ADM1"].status = "error"
-            yield futures["v7-cgaz-lsib"], lsib
-            yield futures["v7-gbOpen-KEN-ADM1"], ok
-            yield futures["v7-gbOpen-UGA-ADM1"], (MemoryError, MemoryError(), None)
-            self.fail("kept waiting on CGAZ after a strict failure")
-
-        as_completed.side_effect = completed
-
-        successes, failures, cgaz = run.run_boundary_builds(
-            "tcp://scheduler",
-            "postgresql://db",
-            "https://lsib",
-            version="v7",
-            strict=True,
+    @classmethod
+    def setUpClass(cls):
+        cls.cluster = LocalCluster(
+            n_workers=2, threads_per_worker=1, processes=False, dashboard_address=None
         )
 
-        self.assertEqual(len(successes), 1)
-        self.assertEqual(failures[0]["iso"], "UGA")
+    @classmethod
+    def tearDownClass(cls):
+        cls.cluster.close()
+
+    def setUp(self):
+        STARTED.clear()
+
+    def build(self, boundaries, strict=False):
+        with patch("builder.run.discover_boundaries", return_value=boundaries):
+            return run.run_boundary_builds(
+                self.cluster.scheduler_address,
+                "postgresql://db",
+                "https://lsib",
+                version="t",
+                strict=strict,
+            )
+
+    def test_big_builds_start_first_and_cgaz_fills_the_tail(self):
+        successes, failures, cgaz = self.build(
+            [
+                ("gbOpen", "AAA", "ADM1", 1),
+                ("gbOpen", "BOOM", "ADM1", 3),
+                ("gbOpen", "CAN", "ADM2", 100),
+                ("gbOpen", "BBB", "ADM1", 2),
+                ("gbOpen", "USA", "ADM1", 90),
+            ]
+        )
+
+        self.assertEqual(set(STARTED[:2]), {"CGAZ/LSIB", "gbOpen/CAN_ADM2"})
+        self.assertEqual(STARTED[2], "gbOpen/USA_ADM1")
+        last_build = max(i for i, t in enumerate(STARTED) if t.startswith("gbOpen"))
+        first_cgaz = min(
+            i
+            for i, t in enumerate(STARTED)
+            if t.startswith("CGAZ/") and t != "CGAZ/LSIB"
+        )
+        self.assertLess(last_build, first_cgaz)
+
+        self.assertEqual(len(successes), 4)
+        self.assertEqual(failures[0]["iso"], "BOOM")
         self.assertEqual(failures[0]["failed_stage"], "dask")
         self.assertIn("MemoryError", failures[0]["error"])
-        self.assertEqual(cgaz, [{"status": "ok", "tag": "CGAZ/LSIB"}])
-        cancelled = {f.key for f in client.cancel.call_args.args[0]}
-        self.assertEqual(cancelled, {"v7-cgaz-lsib", "v7-cgaz-KEN", "v7-cgaz-UGA"})
+        by_tag = {r["tag"]: r for r in cgaz}
+        self.assertEqual(
+            sorted(by_tag),
+            ["CGAZ/AAA", "CGAZ/BBB", "CGAZ/BOOM", "CGAZ/CAN", "CGAZ/LSIB", "CGAZ/USA"],
+        )
+        # BOOM's CGAZ still runs, without the level that failed.
+        self.assertEqual(
+            by_tag["CGAZ/BOOM"]["builds"], [{"adm": "ADM1", "status": "error"}]
+        )
+
+    def test_strict_failure_abandons_cgaz(self):
+        successes, failures, cgaz = self.build(
+            [("gbOpen", "AAA", "ADM1", 2), ("gbOpen", "BAD", "ADM1", 1)], strict=True
+        )
+
+        self.assertEqual([f["iso"] for f in failures], ["BAD"])
+        self.assertNotIn("CGAZ/BAD", STARTED)
+        self.assertNotIn("CGAZ/BAD", [r["tag"] for r in cgaz])
 
 
 class PipelineCheckTests(unittest.TestCase):

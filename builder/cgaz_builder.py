@@ -11,10 +11,10 @@ the boundary builds:
                       territories into their parent country, assigns ISO
                       codes and dissolves to one shape per country (and per
                       disputed area) in `cgaz_lsib`.
-  build_cgaz_country  Dask task, one per gbOpen ISO.  Waits on LSIB and that
-                      country's gbOpen ADM0-2 builds, then simplifies its
-                      ADM1/ADM2 and clips them to the LSIB country outline
-                      into `cgaz_parts`.
+  build_cgaz_country  Dask task, one per gbOpen ISO.  Queued by the driver
+                      once LSIB and that country's gbOpen ADM0-2 builds are
+                      done; simplifies its ADM1/ADM2 and clips them to the
+                      LSIB country outline into `cgaz_parts`.
   merge (__main__)    Single-pod Kubernetes Job.  Assembles each global layer
                       from PostGIS, closes small gaps, writes GeoJSON,
                       GeoPackage and zipped Shapefile, uploads them, and
@@ -287,8 +287,8 @@ def split_lsib(lsib, codes):
 def prepare_lsib(lsib_url, db_url):
     """Dask task: load the LSIB base layer into `cgaz_lsib`.
 
-    Returns a result dict with "status" ("ok" or "error"); every
-    build_cgaz_country task waits on it.
+    Returns a result dict with "status" ("ok" or "error").  No
+    build_cgaz_country task runs until this one has succeeded.
     """
 
     t0 = time.perf_counter()
@@ -406,22 +406,16 @@ def _clip_boundary(engine, iso, adm, outline_path, workdir):
     return _to_parts_frame(gpd.read_file(out))
 
 
-def build_cgaz_country(iso, db_url, lsib, *builds):
+def build_cgaz_country(iso, db_url, builds):
     """Dask task: write one country's clipped ADM1/ADM2 to `cgaz_parts`.
 
-    `lsib` and `builds` are the results of prepare_lsib and of this
-    country's gbOpen ADM0-2 builds.  Passing them as arguments makes Dask
-    hold this task until they're all done; only levels that built
-    successfully this run are used.
+    The driver only runs this once LSIB is loaded and this country's
+    gbOpen ADM0-2 builds have finished.  `builds` holds their
+    {"adm", "status"}; only levels that built successfully are used.
     """
 
     t0 = time.perf_counter()
     result = {"task": "country", "iso": iso}
-    if lsib.get("status") != "ok":
-        result.update(status="error", error="LSIB base layer failed to load")
-        result["timings"] = {"total": 0.0}
-        return result
-
     sources = cgaz_sources({b["adm"] for b in builds if b.get("status") == "ok"})
     result["sources"] = sources
     tmpdir = Path(tempfile.mkdtemp(prefix=f"gb-cgaz-{iso}-"))
